@@ -279,113 +279,34 @@ def _save_last_host(host):
         pass  # not fatal -- just means we'll ask again next time
 
 
-def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names):
-    """Orca caches a fully-resolved (inheritance-flattened) snapshot of a
-    user preset per printer/nozzle combination it's actually been used
-    with, in a "base" subdirectory next to the preset's own delta file,
-    named "<preset name> @<printer preset name>.json" -- confirmed by
-    inspecting real cached files on disk. Unlike the preset's own delta
-    file (which stores only overrides relative to its parent), these
-    snapshots have every field already merged in, including filament_id.
-
-    This is the ONLY way to recover filament_id for a preset whose
-    "inherits" chain leads into Orca's separate OrcaFilamentLibrary bundle
-    (an "@System" reference) -- that bundle ships as an undocumented
-    proprietary binary format (confirmed: not JSON, not zip; a "ZCRO"
-    magic header), unreadable directly, and its resolution goes through a
-    regex-based fuzzy-matcher in Orca's C++ that isn't exposed to plugins
-    at all. The recovered id here is one of Orca's own synthetic ids (e.g.
-    "P6f52551"), not a Bambu GFxxx-style id -- confirmed against real
-    cached files -- but that's fine for our purposes: it only needs to not
-    collide with an existing AMS catalog entry, which an Orca-internal id
-    naturally won't.
-
-    Only checks combinations against X1/X1C printer names, since that's
-    what we're pushing to. Orca builds these caches lazily, only for
-    printer/nozzle combos actually used in the app -- a preset that's
-    never been selected while an X1 was the active printer simply won't
-    have one yet, so a miss here is expected, not a bug; callers should
-    fall back to the direct inherits-chain walk."""
-    base_dir = os.path.join(os.path.dirname(preset_file_path), "base")
-    for printer_name in x1_printer_names:
-        candidate = os.path.join(base_dir, f"{preset_name} @{printer_name}.json")
-        try:
-            with open(candidate, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue
-        filament_id = data.get("filament_id", "") or ""
-        setting_id = data.get("setting_id", "") or ""
-        if filament_id or setting_id:
-            return filament_id, setting_id
-    return "", ""
-
-
-def _read_catalog_ids_from_preset_file(path, collection=None, _depth=0):
-    """Read Bambu's cloud catalog IDs (filament_id/setting_id, e.g. "GFA00")
-    out of a preset's own JSON file on disk, walking its "inherits" chain.
-
-    These two fields are NOT reachable through Orca's Python preset bindings
-    at all -- confirmed against source: preset.config_value() only reaches
-    DynamicPrintConfig options (registered ConfigOptionDefs in
-    PrintConfig.cpp), but filament_id/setting_id are separate plain-string
-    members directly on the C++ Preset object (Preset.hpp), populated from
-    "filament_id"/"setting_id" keys in the vendor profile JSON and never
-    merged into the option config -- an actual gap in the bindings, not a
-    wrong guess.
-
-    Walking "inherits" is necessary, not optional: confirmed against real
-    shipped BBL profiles that these two fields routinely live on DIFFERENT
-    files in the same chain. E.g. for "Bambu PLA Basic" on an X1 Carbon,
-    `preset.file` resolves to ".../Bambu PLA Basic @BBL X1C.json", which
-    directly defines "setting_id" but NOT "filament_id" -- that one only
-    exists on its parent, ".../Bambu PLA Basic @base.json" (referenced via
-    that file's own "inherits" key, resolved to a sibling file in the same
-    directory, matching the observed on-disk naming convention of
-    "<inherits value>.json"). A single-file read (the previous
-    implementation) silently got setting_id right and filament_id wrong for
-    exactly this preset -- not a hypothetical edge case.
-
-    Also tries Orca's own PresetCollection.find_preset() to resolve
-    "inherits" before falling back to the same-directory sibling-file
-    guess, since a CUSTOM preset's "inherits" value is often a canonical
-    name (e.g. "Generic PLA @MyToolChanger") pointing at a file in a
-    completely different directory than the child -- the naive guess only
-    works within a single vendor bundle's own directory (which is exactly
-    the case this function was first verified against: a system preset's
-    "@base" parent, always a sibling file).
-
-    Returns ("", "") if the file (or any ancestor) is missing, unreadable,
-    not JSON, the reference can't be resolved, or the chain never defines a
-    field -- silently, since this remains best-effort and the fields stay
-    manually editable either way."""
-    if not path or _depth > 8:  # depth guard against an unexpected inherits cycle
-        return "", ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return "", ""
-
-    filament_id = data.get("filament_id", "") or ""
-    setting_id = data.get("setting_id", "") or ""
-    inherits = data.get("inherits", "")
-    if inherits and (not filament_id or not setting_id):
-        parent_path = ""
-        if collection is not None:
-            try:
-                parent_preset = collection.find_preset(inherits)
-                if parent_preset is not None:
-                    parent_path = getattr(parent_preset, "file", "") or ""
-            except Exception:
-                parent_path = ""
-        if not parent_path:
-            parent_path = os.path.join(os.path.dirname(path), f"{inherits}.json")
-        parent_filament_id, parent_setting_id = _read_catalog_ids_from_preset_file(parent_path, collection, _depth + 1)
-        filament_id = filament_id or parent_filament_id
-        setting_id = setting_id or parent_setting_id
-    return filament_id, setting_id
-
+# filament_id/setting_id (Bambu's GFxxx cloud catalog IDs) CANNOT be read by
+# this plugin at all, for two independently confirmed reasons, and both
+# earlier attempts at it (a same-directory sibling-file guess, then a
+# PresetCollection.find_preset()-based inherits walker, then reading Orca's
+# per-printer resolved-preset cache under "filament/base/") have been
+# removed rather than left as dead, silently-failing code:
+#   1. filament_id/setting_id are NOT reachable through the Python preset
+#      bindings -- preset.config_value() only reaches DynamicPrintConfig
+#      options; these two are separate string members directly on the C++
+#      Preset object (Preset.hpp), never merged into that config.
+#   2. Reading them straight out of Orca's own JSON preset files via a plain
+#      Python open() -- which would otherwise have worked, and did in
+#      offline testing outside Orca's runtime -- is unconditionally blocked
+#      by Orca's own plugin security sandbox on Linux, with no override
+#      possible from plugin code: confirmed via
+#      PluginAuditManager::is_denied_path_keyword() (denies any path with a
+#      "conf"/"cert"/"secret" substring in ANY path component, checked
+#      before permissions or allowed-roots), which collides with every path
+#      under Orca's own data directory (~/.config/OrcaSlicer -- ".config"
+#      contains "conf"). This denies the read outright with no prompt, for
+#      literally every file under Orca's data directory, including the
+#      preset JSONs, the resolved-preset cache, and even this plugin's own
+#      nominally-allowed storage folder (also under that same directory).
+#      No permission grant, no request_permissions() call, and no directory
+#      choice changes this -- it's a categorical block that runs first.
+# Bottom line: these two fields stay manual-entry only. The defaults
+# (GFL999/GFSL999) are safe, deliberately-fake placeholders for a one-off
+# test; pick your own unique values for anything meant to stick around.
 
 # X1Plus firmware targets the X1 / X1 Carbon -- deliberately excludes the
 # enterprise X1E, which isn't what this project jailbreaks. Matched against
@@ -457,12 +378,11 @@ def _list_filament_profiles():
     docs.
 
     Returns (profiles, default_name) where profiles maps
-    name -> {"type", "vendor", "temp_min", "temp_max", "filament_id",
-    "setting_id", "is_user"} (the last two are often "" -- see
-    _read_catalog_ids_from_preset_file), and default_name is the
-    currently-selected preset's name (or "" if that can't be determined, or
-    if it got filtered out -- not fatal, the dropdown just opens
-    unselected)."""
+    name -> {"type", "vendor", "temp_min", "temp_max", "is_user"} (no
+    filament_id/setting_id -- see the comment above this function for why
+    that can't be read), and default_name is the currently-selected
+    preset's name (or "" if that can't be determined, or if it got
+    filtered out -- not fatal, the dropdown just opens unselected)."""
     profiles = {}
     default_name = ""
     try:
@@ -475,19 +395,11 @@ def _list_filament_profiles():
                 continue
             if x1_printer_names and not _is_x1_compatible(preset, x1_printer_names):
                 continue
-            preset_file = getattr(preset, "file", "")
-            filament_id, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names)
-            if not filament_id or not setting_id:
-                fallback_filament_id, fallback_setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
-                filament_id = filament_id or fallback_filament_id
-                setting_id = setting_id or fallback_setting_id
             profiles[name] = {
                 "type": preset.config_value("filament_type") or "",
                 "vendor": preset.config_value("filament_vendor") or "",
                 "temp_min": preset.config_value("nozzle_temperature_range_low") or "",
                 "temp_max": preset.config_value("nozzle_temperature_range_high") or "",
-                "filament_id": filament_id,
-                "setting_id": setting_id,
                 "is_user": bool(preset.is_user()),
             }
         try:
@@ -583,9 +495,10 @@ def _build_push_dialog_html(profiles, default_name, default_host=""):
 <label>Nozzle temp min (C)<input id="temp_min" type="number" value=""></label>
 <label>Nozzle temp max (C)<input id="temp_max" type="number" value=""></label>
 <label>filament_id (must be unique, e.g. GFL999)<input id="filament_id" value="GFL999">
-  <small>Auto-filled only when the selected profile's own JSON directly defines
-  one (not all profiles do). Reusing an existing id updates that entry;
-  use a new, unused id to add a distinct new one instead.</small></label>
+  <small>Not auto-fillable from a profile (Orca's plugin sandbox blocks
+  reading this field from any profile, by design -- see project docs).
+  Reusing an EXISTING id here updates that catalog entry; use a new,
+  unused id to add a distinct new one instead.</small></label>
 <label>setting_id (e.g. GFSL999)<input id="setting_id" value="GFSL999"></label>
 <button onclick="submitForm()">Push to AMS</button>
 <script>
@@ -600,11 +513,6 @@ function applyProfile() {{
   document.getElementById('vendor').value = p.vendor || '';
   document.getElementById('temp_min').value = p.temp_min || '';
   document.getElementById('temp_max').value = p.temp_max || '';
-  // Only overwrite these when the profile's JSON actually had them --
-  // otherwise leave whatever the user already typed (e.g. the safe
-  // placeholder default) alone rather than clobbering it with blank.
-  if (p.filament_id) {{ document.getElementById('filament_id').value = p.filament_id; }}
-  if (p.setting_id) {{ document.getElementById('setting_id').value = p.setting_id; }}
 }}
 
 function submitForm() {{
@@ -649,7 +557,13 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
 
         profiles, default_name = _list_filament_profiles()
 
-        orca.host.ui.create_window(
+        # create_window() does NOT auto-close when on_submit fires -- confirmed
+        # against source, it returns a handle with its own .close() method
+        # that the caller is expected to call. Leaving this uncaptured left
+        # the form window stuck open indefinitely after every submission,
+        # stacking against whatever result message tried to show on top of
+        # it -- the likely cause of the plugin appearing to hang.
+        self._window = orca.host.ui.create_window(
             html=_build_push_dialog_html(profiles, default_name, default_host=_load_last_host()),
             title="Push filament to X1Plus AMS",
             width=460,
@@ -662,7 +576,14 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
         # the user submits the form. Nothing to wait for here.
         return orca.ExecutionResult.success("Dialog opened")
 
+    def _close_window(self):
+        try:
+            self._window.close()
+        except Exception:
+            pass
+
     def _on_submit(self, result):
+        self._close_window()  # close the form immediately, before any slow work
         try:
             temp_min = int(result["temp_min"])
             temp_max = int(result["temp_max"])
@@ -723,7 +644,7 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
         <button onclick="orca.submit({{host: document.getElementById('host').value, password: document.getElementById('password').value}})">Bootstrap</button>
         </body></html>
         """
-        orca.host.ui.create_window(
+        self._window = orca.host.ui.create_window(
             html=bootstrap_html,
             title="X1Plus: SSH key setup",
             width=360,
@@ -734,7 +655,14 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
         )
         return orca.ExecutionResult.success("Dialog opened")
 
+    def _close_window(self):
+        try:
+            self._window.close()
+        except Exception:
+            pass
+
     def _on_submit(self, result):
+        self._close_window()  # close the form immediately, before any slow work
         if not result or not result.get("password"):
             orca.host.ui.message("A root password is required to bootstrap.", title="X1Plus: SSH key setup")
             return
@@ -751,5 +679,20 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
 @orca.plugin
 class X1PlusPlugin(orca.base):
     def register_capabilities(self):
+        # orca.request_permissions() is only callable here, during plugin
+        # discovery -- confirmed against source (PythonPluginBridge.cpp):
+        # calling it later (e.g. from inside a running capability) raises.
+        # It batches every listed path into ONE upfront Yes/No prompt,
+        # persisted into .install_state.json, rather than a separate prompt
+        # per file per run. Matching is by exact string, so these must be
+        # the literal paths later passed to open() -- which they are, since
+        # both are the same module-level constants used everywhere else.
+        # This does NOT cover the doomed preset-JSON reads discussed above
+        # (those are blocked by a different, unconditional check that
+        # doesn't consult this permission list at all).
+        try:
+            orca.request_permissions(fs_read=[PRIVATE_KEY_PATH, LAST_HOST_PATH])
+        except Exception:
+            pass  # older Orca build without this API -- reads just fall back to per-event prompts
         orca.register_capability(BootstrapX1Plus)
         orca.register_capability(PushFilamentToX1Plus)
