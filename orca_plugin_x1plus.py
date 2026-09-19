@@ -279,7 +279,49 @@ def _save_last_host(host):
         pass  # not fatal -- just means we'll ask again next time
 
 
-def _read_catalog_ids_from_preset_file(path, _depth=0):
+def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names):
+    """Orca caches a fully-resolved (inheritance-flattened) snapshot of a
+    user preset per printer/nozzle combination it's actually been used
+    with, in a "base" subdirectory next to the preset's own delta file,
+    named "<preset name> @<printer preset name>.json" -- confirmed by
+    inspecting real cached files on disk. Unlike the preset's own delta
+    file (which stores only overrides relative to its parent), these
+    snapshots have every field already merged in, including filament_id.
+
+    This is the ONLY way to recover filament_id for a preset whose
+    "inherits" chain leads into Orca's separate OrcaFilamentLibrary bundle
+    (an "@System" reference) -- that bundle ships as an undocumented
+    proprietary binary format (confirmed: not JSON, not zip; a "ZCRO"
+    magic header), unreadable directly, and its resolution goes through a
+    regex-based fuzzy-matcher in Orca's C++ that isn't exposed to plugins
+    at all. The recovered id here is one of Orca's own synthetic ids (e.g.
+    "P6f52551"), not a Bambu GFxxx-style id -- confirmed against real
+    cached files -- but that's fine for our purposes: it only needs to not
+    collide with an existing AMS catalog entry, which an Orca-internal id
+    naturally won't.
+
+    Only checks combinations against X1/X1C printer names, since that's
+    what we're pushing to. Orca builds these caches lazily, only for
+    printer/nozzle combos actually used in the app -- a preset that's
+    never been selected while an X1 was the active printer simply won't
+    have one yet, so a miss here is expected, not a bug; callers should
+    fall back to the direct inherits-chain walk."""
+    base_dir = os.path.join(os.path.dirname(preset_file_path), "base")
+    for printer_name in x1_printer_names:
+        candidate = os.path.join(base_dir, f"{preset_name} @{printer_name}.json")
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        filament_id = data.get("filament_id", "") or ""
+        setting_id = data.get("setting_id", "") or ""
+        if filament_id or setting_id:
+            return filament_id, setting_id
+    return "", ""
+
+
+def _read_catalog_ids_from_preset_file(path, collection=None, _depth=0):
     """Read Bambu's cloud catalog IDs (filament_id/setting_id, e.g. "GFA00")
     out of a preset's own JSON file on disk, walking its "inherits" chain.
 
@@ -304,9 +346,19 @@ def _read_catalog_ids_from_preset_file(path, _depth=0):
     implementation) silently got setting_id right and filament_id wrong for
     exactly this preset -- not a hypothetical edge case.
 
+    Also tries Orca's own PresetCollection.find_preset() to resolve
+    "inherits" before falling back to the same-directory sibling-file
+    guess, since a CUSTOM preset's "inherits" value is often a canonical
+    name (e.g. "Generic PLA @MyToolChanger") pointing at a file in a
+    completely different directory than the child -- the naive guess only
+    works within a single vendor bundle's own directory (which is exactly
+    the case this function was first verified against: a system preset's
+    "@base" parent, always a sibling file).
+
     Returns ("", "") if the file (or any ancestor) is missing, unreadable,
-    not JSON, or the chain never defines a field -- silently, since this
-    remains best-effort and the fields stay manually editable either way."""
+    not JSON, the reference can't be resolved, or the chain never defines a
+    field -- silently, since this remains best-effort and the fields stay
+    manually editable either way."""
     if not path or _depth > 8:  # depth guard against an unexpected inherits cycle
         return "", ""
     try:
@@ -319,8 +371,17 @@ def _read_catalog_ids_from_preset_file(path, _depth=0):
     setting_id = data.get("setting_id", "") or ""
     inherits = data.get("inherits", "")
     if inherits and (not filament_id or not setting_id):
-        parent_path = os.path.join(os.path.dirname(path), f"{inherits}.json")
-        parent_filament_id, parent_setting_id = _read_catalog_ids_from_preset_file(parent_path, _depth + 1)
+        parent_path = ""
+        if collection is not None:
+            try:
+                parent_preset = collection.find_preset(inherits)
+                if parent_preset is not None:
+                    parent_path = getattr(parent_preset, "file", "") or ""
+            except Exception:
+                parent_path = ""
+        if not parent_path:
+            parent_path = os.path.join(os.path.dirname(path), f"{inherits}.json")
+        parent_filament_id, parent_setting_id = _read_catalog_ids_from_preset_file(parent_path, collection, _depth + 1)
         filament_id = filament_id or parent_filament_id
         setting_id = setting_id or parent_setting_id
     return filament_id, setting_id
@@ -414,7 +475,12 @@ def _list_filament_profiles():
                 continue
             if x1_printer_names and not _is_x1_compatible(preset, x1_printer_names):
                 continue
-            filament_id, setting_id = _read_catalog_ids_from_preset_file(getattr(preset, "file", ""))
+            preset_file = getattr(preset, "file", "")
+            filament_id, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names)
+            if not filament_id or not setting_id:
+                fallback_filament_id, fallback_setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
+                filament_id = filament_id or fallback_filament_id
+                setting_id = setting_id or fallback_setting_id
             profiles[name] = {
                 "type": preset.config_value("filament_type") or "",
                 "vendor": preset.config_value("filament_vendor") or "",
