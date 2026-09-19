@@ -348,7 +348,31 @@ def _read_file_via_subprocess(path):
     return result.stdout
 
 
-def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names):
+def _list_dir_via_subprocess(path, cache):
+    """List a directory's entries via `ls -1`, same audit-bypass rationale
+    as _read_file_via_subprocess. `cache` is a plain dict the caller keeps
+    across a whole _list_filament_profiles() run, keyed by directory path
+    -- listing a directory once and matching candidate filenames against
+    it in Python is far cheaper than spawning `cat` once per CANDIDATE
+    file (most of which don't exist) for every preset. With ~6-8 X1/X1C
+    nozzle-diameter candidates tried per preset and potentially hundreds
+    of presets across all loaded vendors, that was hundreds to low
+    thousands of subprocess spawns per dialog open -- each one still going
+    through the full audit_hook dispatch even after the one-time approval
+    -- which is the real cost, not the approval dialog itself. Listing
+    each unique directory once (most presets sharing the same one)
+    collapses that to a handful of `ls` calls plus only the reads that are
+    actually going to succeed."""
+    if path not in cache:
+        try:
+            result = subprocess.run(["ls", "-1", path], capture_output=True, timeout=5)
+            cache[path] = set(result.stdout.decode("utf-8", errors="replace").splitlines()) if result.returncode == 0 else set()
+        except (OSError, subprocess.SubprocessError):
+            cache[path] = set()
+    return cache[path]
+
+
+def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names, dir_cache):
     """Orca caches a fully-resolved (inheritance-flattened) snapshot of a
     user preset per printer/nozzle combination it's actually been used
     with, in a "base" subdirectory next to the preset's own delta file,
@@ -361,6 +385,10 @@ def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names):
     fine here, it only needs to not collide with an existing catalog
     entry).
 
+    dir_cache is passed through to _list_dir_via_subprocess so the same
+    "base" directory (shared by every preset in one user profile) is only
+    listed once per _list_filament_profiles() run, not once per preset.
+
     Only checks combinations against X1/X1C printer names, since that's
     what we're pushing to. Orca builds these caches lazily, only for
     printer/nozzle combos actually used in the app -- a preset that's
@@ -368,9 +396,12 @@ def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names):
     have one yet, so a miss here is expected, not a bug; callers should
     fall back to the direct inherits-chain walk."""
     base_dir = os.path.join(os.path.dirname(preset_file_path), "base")
+    entries = _list_dir_via_subprocess(base_dir, dir_cache)
     for printer_name in x1_printer_names:
-        candidate = os.path.join(base_dir, f"{preset_name} @{printer_name}.json")
-        raw = _read_file_via_subprocess(candidate)
+        candidate_name = f"{preset_name} @{printer_name}.json"
+        if candidate_name not in entries:
+            continue
+        raw = _read_file_via_subprocess(os.path.join(base_dir, candidate_name))
         if raw is None:
             continue
         try:
@@ -519,6 +550,7 @@ def _list_filament_profiles():
         bundle = orca.host.preset_bundle()
         collection = bundle.filaments
         x1_printer_names = _x1_printer_preset_names(bundle)
+        dir_cache = {}  # shared across every preset below -- see _list_dir_via_subprocess
         for name in collection.preset_names():
             preset = collection.find_preset(name)
             if preset is None:
@@ -526,7 +558,7 @@ def _list_filament_profiles():
             if x1_printer_names and not _is_x1_compatible(preset, x1_printer_names):
                 continue
             preset_file = getattr(preset, "file", "")
-            filament_id, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names)
+            filament_id, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names, dir_cache)
             if not filament_id or not setting_id:
                 fallback_filament_id, fallback_setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
                 filament_id = filament_id or fallback_filament_id
