@@ -43,6 +43,7 @@ except ImportError:
 
 KEY_DIR = os.path.expanduser("~/.x1plus_orca_plugin")
 PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "id_rsa")
+LAST_HOST_PATH = os.path.join(KEY_DIR, "last_host.txt")
 PUBLIC_KEY_COMMENT = "orca-x1plus-plugin"
 REMOTE_DEPLOY_DIR = "/userdata/cfg/filament"
 REMOTE_DEPLOY_NAME = "orca-plugin-filament.zip"  # deliberately no ".sig"
@@ -217,6 +218,64 @@ class X1PlusDeployer:
             client.close()
 
 
+def _load_last_host():
+    """Last successfully-used printer IP/hostname, shared across both
+    capabilities. Orca does expose a config store to plugins
+    (self.get_config()/self.save_config() on the capability instance,
+    verified against PythonPluginBridge.cpp), but it's scoped per capability
+    with no shared key -- Bootstrap and Push would each get their own
+    independent blob. A plain file next to the SSH key (which we already
+    read/write with no special permission handling) is simpler and shared
+    naturally between them."""
+    try:
+        with open(LAST_HOST_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _save_last_host(host):
+    host = (host or "").strip()
+    if not host:
+        return
+    try:
+        os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+        with open(LAST_HOST_PATH, "w", encoding="utf-8") as f:
+            f.write(host)
+    except OSError:
+        pass  # not fatal -- just means we'll ask again next time
+
+
+def _read_catalog_ids_from_preset_file(path):
+    """Best-effort read of Bambu's cloud catalog IDs (filament_id/setting_id,
+    e.g. "GFA00") straight out of a preset's own JSON file on disk.
+
+    These two fields are NOT reachable through Orca's Python preset bindings
+    at all -- confirmed against source: preset.config_value() only reaches
+    DynamicPrintConfig options (registered ConfigOptionDefs in
+    PrintConfig.cpp), but filament_id/setting_id are separate plain-string
+    members directly on the C++ Preset object (Preset.hpp), populated from
+    "filament_id"/"setting_id" keys in the vendor profile JSON and never
+    merged into the option config. There is no Python-exposed accessor for
+    them at all -- not a wrong guess, an actual gap in the bindings.
+
+    This only finds a value when the preset's own leaf JSON file directly
+    defines the field, which is true for most base system filament profiles
+    but NOT for presets that only inherit it from a parent profile (Orca
+    resolves "inherits" chains in C++ memory; this doesn't reimplement
+    that). Returns ("", "") if the file is missing, unreadable, not JSON, or
+    doesn't directly define these keys -- silently, since this is inherently
+    best-effort and the fields stay manually editable either way."""
+    if not path:
+        return "", ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("filament_id", "") or "", data.get("setting_id", "") or ""
+    except (OSError, ValueError):
+        return "", ""
+
+
 def _list_filament_profiles():
     """Enumerate every filament profile Orca knows about (system presets and
     the user's own custom ones), keyed by display name, with the fields our
@@ -226,9 +285,11 @@ def _list_filament_profiles():
     source, not scraped from docs.
 
     Returns (profiles, default_name) where profiles maps
-    name -> {"type", "vendor", "temp_min", "temp_max", "is_user"}, and
-    default_name is the currently-selected preset's name (or "" if that
-    can't be determined -- not fatal, the dropdown just opens unselected)."""
+    name -> {"type", "vendor", "temp_min", "temp_max", "filament_id",
+    "setting_id", "is_user"} (the last two are often "" -- see
+    _read_catalog_ids_from_preset_file), and default_name is the
+    currently-selected preset's name (or "" if that can't be determined --
+    not fatal, the dropdown just opens unselected)."""
     profiles = {}
     default_name = ""
     try:
@@ -238,11 +299,14 @@ def _list_filament_profiles():
             preset = collection.find_preset(name)
             if preset is None:
                 continue
+            filament_id, setting_id = _read_catalog_ids_from_preset_file(getattr(preset, "file", ""))
             profiles[name] = {
                 "type": preset.config_value("filament_type") or "",
                 "vendor": preset.config_value("filament_vendor") or "",
                 "temp_min": preset.config_value("nozzle_temperature_range_low") or "",
                 "temp_max": preset.config_value("nozzle_temperature_range_high") or "",
+                "filament_id": filament_id,
+                "setting_id": setting_id,
                 "is_user": bool(preset.is_user()),
             }
         try:
@@ -305,12 +369,13 @@ def _profile_options_html(profiles, default_name):
     return "\n".join(parts)
 
 
-def _build_push_dialog_html(profiles, default_name):
+def _build_push_dialog_html(profiles, default_name, default_host=""):
     # Embedded inside a <script> tag, not an HTML attribute, so only the
     # "</script" escape below is needed (no HTML-attribute quoting concerns).
     profiles_json = json.dumps(profiles).replace("</", "<\\/")
     default_name_json = json.dumps(default_name)
     options_html = _profile_options_html(profiles, default_name)
+    host_attr = html.escape(default_host, quote=True)
 
     return f"""
 <html><body style="font-family: var(--orca-font); background: var(--orca-bg); color: var(--orca-fg); padding: 12px;">
@@ -320,8 +385,9 @@ def _build_push_dialog_html(profiles, default_name):
           background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); }}
   button {{ margin-top: 16px; padding: 8px 16px; background: var(--orca-accent);
            color: var(--orca-accent-fg); border: none; cursor: pointer; }}
+  small {{ display: block; margin-top: 2px; font-size: 11px; color: var(--orca-muted); }}
 </style>
-<label>Printer IP / hostname<input id="host" value=""></label>
+<label>Printer IP / hostname<input id="host" value="{host_attr}"></label>
 <label>Root password (leave blank if you've already bootstrapped this printer)
   <input id="password" type="password"></label>
 <hr>
@@ -335,7 +401,10 @@ def _build_push_dialog_html(profiles, default_name):
 <label>Vendor<input id="vendor" value=""></label>
 <label>Nozzle temp min (C)<input id="temp_min" type="number" value=""></label>
 <label>Nozzle temp max (C)<input id="temp_max" type="number" value=""></label>
-<label>filament_id (must be unique, e.g. GFL999)<input id="filament_id" value="GFL999"></label>
+<label>filament_id (must be unique, e.g. GFL999)<input id="filament_id" value="GFL999">
+  <small>Auto-filled only when the selected profile's own JSON directly defines
+  one (not all profiles do). Reusing an existing id updates that entry;
+  use a new, unused id to add a distinct new one instead.</small></label>
 <label>setting_id (e.g. GFSL999)<input id="setting_id" value="GFSL999"></label>
 <button onclick="submitForm()">Push to AMS</button>
 <script>
@@ -350,6 +419,11 @@ function applyProfile() {{
   document.getElementById('vendor').value = p.vendor || '';
   document.getElementById('temp_min').value = p.temp_min || '';
   document.getElementById('temp_max').value = p.temp_max || '';
+  // Only overwrite these when the profile's JSON actually had them --
+  // otherwise leave whatever the user already typed (e.g. the safe
+  // placeholder default) alone rather than clobbering it with blank.
+  if (p.filament_id) {{ document.getElementById('filament_id').value = p.filament_id; }}
+  if (p.setting_id) {{ document.getElementById('setting_id').value = p.setting_id; }}
 }}
 
 function submitForm() {{
@@ -395,7 +469,7 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
         profiles, default_name = _list_filament_profiles()
 
         orca.host.ui.create_window(
-            html=_build_push_dialog_html(profiles, default_name),
+            html=_build_push_dialog_html(profiles, default_name, default_host=_load_last_host()),
             title="Push filament to X1Plus AMS",
             width=460,
             height=640,
@@ -445,6 +519,7 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
         if error:
             orca.host.ui.message(error, title="X1Plus Filament Push failed")
         else:
+            _save_last_host(result["host"])
             orca.host.ui.message(f"Pushed {result['name']!r} to the AMS catalog", title="X1Plus Filament Push")
 
 
@@ -459,15 +534,16 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
                 "paramiko isn't available in Orca's plugin environment",
             )
 
-        html = """
+        host_attr = html.escape(_load_last_host(), quote=True)
+        bootstrap_html = f"""
         <html><body style="font-family: var(--orca-font); background: var(--orca-bg); color: var(--orca-fg); padding: 12px;">
-        <label>Printer IP / hostname<input id="host" style="width:100%%"></label><br>
-        <label>Root password (used once, never stored)<input id="password" type="password" style="width:100%%"></label><br>
-        <button onclick="orca.submit({host: document.getElementById('host').value, password: document.getElementById('password').value})">Bootstrap</button>
+        <label>Printer IP / hostname<input id="host" value="{host_attr}" style="width:100%"></label><br>
+        <label>Root password (used once, never stored)<input id="password" type="password" style="width:100%"></label><br>
+        <button onclick="orca.submit({{host: document.getElementById('host').value, password: document.getElementById('password').value}})">Bootstrap</button>
         </body></html>
         """
         orca.host.ui.create_window(
-            html=html,
+            html=bootstrap_html,
             title="X1Plus: SSH key setup",
             width=360,
             height=220,
@@ -487,6 +563,7 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
         if error:
             orca.host.ui.message(error, title="X1Plus: SSH key setup failed")
         else:
+            _save_last_host(result["host"])
             orca.host.ui.message(f"SSH key installed on {result['host']}", title="X1Plus: SSH key setup")
 
 
