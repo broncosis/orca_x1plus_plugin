@@ -26,6 +26,7 @@
 # extracted filament catalog and the real .sig file's header format --
 # that part is solid. This file just wraps it in Orca's plugin UI.
 
+import html
 import io
 import json
 import os
@@ -216,32 +217,41 @@ class X1PlusDeployer:
             client.close()
 
 
-def _prefill_from_preset():
-    """Best-effort attempt to read the currently-selected filament preset
-    from Orca so the dialog can prefill fields. Field names on the preset
-    bundle object are a guess -- this must not raise, just return {} if
-    wrong so the dialog still opens with blank fields."""
-    prefill = {"name": "", "type": "PLA", "vendor": "", "temp_min": "", "temp_max": ""}
+def _list_filament_profiles():
+    """Enumerate every filament profile Orca knows about (system presets and
+    the user's own custom ones), keyed by display name, with the fields our
+    AMS entry needs. Verified against OrcaSlicer's PresetBundle Python
+    bindings (PluginHostPresets.cpp) -- unlike the old single-preset guess,
+    preset.config_value() and the exact key names here are confirmed against
+    source, not scraped from docs.
+
+    Returns (profiles, default_name) where profiles maps
+    name -> {"type", "vendor", "temp_min", "temp_max", "is_user"}, and
+    default_name is the currently-selected preset's name (or "" if that
+    can't be determined -- not fatal, the dropdown just opens unselected)."""
+    profiles = {}
+    default_name = ""
     try:
         bundle = orca.host.preset_bundle()
-        preset = bundle.filament  # GUESS: attribute name unverified
-        config = preset.config    # GUESS: attribute name unverified
-        prefill["name"] = getattr(preset, "name", "")
-        ftype = config.get("filament_type", None)
-        if ftype:
-            prefill["type"] = ftype[0] if isinstance(ftype, list) else ftype
-        vendor = config.get("filament_vendor", None)
-        if vendor:
-            prefill["vendor"] = vendor[0] if isinstance(vendor, list) else vendor
-        temp_range = config.get("nozzle_temperature_range_low", None)
-        temp_range_hi = config.get("nozzle_temperature_range_high", None)
-        if temp_range:
-            prefill["temp_min"] = str(temp_range[0] if isinstance(temp_range, list) else temp_range)
-        if temp_range_hi:
-            prefill["temp_max"] = str(temp_range_hi[0] if isinstance(temp_range_hi, list) else temp_range_hi)
+        collection = bundle.filaments
+        for name in collection.preset_names():
+            preset = collection.find_preset(name)
+            if preset is None:
+                continue
+            profiles[name] = {
+                "type": preset.config_value("filament_type") or "",
+                "vendor": preset.config_value("filament_vendor") or "",
+                "temp_min": preset.config_value("nozzle_temperature_range_low") or "",
+                "temp_max": preset.config_value("nozzle_temperature_range_high") or "",
+                "is_user": bool(preset.is_user()),
+            }
+        try:
+            default_name = collection.get_selected_preset().name
+        except Exception:
+            pass
     except Exception:
-        pass  # fields just stay blank -- not fatal
-    return prefill
+        pass  # dropdown just opens empty -- not fatal
+    return profiles, default_name
 
 
 def _run_with_progress(title, work_fn):
@@ -275,30 +285,75 @@ def _run_with_progress(title, work_fn):
     return status["error"]
 
 
-PUSH_DIALOG_HTML = """
+def _profile_options_html(profiles, default_name):
+    def option(name):
+        selected = " selected" if name == default_name else ""
+        escaped = html.escape(name)
+        return f'<option value="{escaped}"{selected}>{escaped}</option>'
+
+    user_names = sorted(n for n, p in profiles.items() if p["is_user"])
+    system_names = sorted(n for n, p in profiles.items() if not p["is_user"])
+    parts = ['<option value="">-- choose a profile, or fill in the fields below manually --</option>']
+    if user_names:
+        parts.append('<optgroup label="Your custom profiles">')
+        parts.extend(option(n) for n in user_names)
+        parts.append("</optgroup>")
+    if system_names:
+        parts.append('<optgroup label="System profiles">')
+        parts.extend(option(n) for n in system_names)
+        parts.append("</optgroup>")
+    return "\n".join(parts)
+
+
+def _build_push_dialog_html(profiles, default_name):
+    # Embedded inside a <script> tag, not an HTML attribute, so only the
+    # "</script" escape below is needed (no HTML-attribute quoting concerns).
+    profiles_json = json.dumps(profiles).replace("</", "<\\/")
+    default_name_json = json.dumps(default_name)
+    options_html = _profile_options_html(profiles, default_name)
+
+    return f"""
 <html><body style="font-family: var(--orca-font); background: var(--orca-bg); color: var(--orca-fg); padding: 12px;">
 <style>
-  label { display: block; margin-top: 10px; font-size: 12px; color: var(--orca-muted); }
-  input { width: 100%%; box-sizing: border-box; padding: 6px; margin-top: 2px;
-          background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); }
-  button { margin-top: 16px; padding: 8px 16px; background: var(--orca-accent);
-           color: var(--orca-accent-fg); border: none; cursor: pointer; }
+  label {{ display: block; margin-top: 10px; font-size: 12px; color: var(--orca-muted); }}
+  select, input {{ width: 100%; box-sizing: border-box; padding: 6px; margin-top: 2px;
+          background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); }}
+  button {{ margin-top: 16px; padding: 8px 16px; background: var(--orca-accent);
+           color: var(--orca-accent-fg); border: none; cursor: pointer; }}
 </style>
-<label>Printer IP / hostname<input id="host" value="%(host)s"></label>
+<label>Printer IP / hostname<input id="host" value=""></label>
 <label>Root password (leave blank if you've already bootstrapped this printer)
   <input id="password" type="password"></label>
 <hr>
-<label>Filament display name<input id="name" value="%(name)s"></label>
-<label>Type (PLA / PETG / ABS / TPU / PETG-CF / ...)<input id="type" value="%(type)s"></label>
-<label>Vendor<input id="vendor" value="%(vendor)s"></label>
-<label>Nozzle temp min (C)<input id="temp_min" type="number" value="%(temp_min)s"></label>
-<label>Nozzle temp max (C)<input id="temp_max" type="number" value="%(temp_max)s"></label>
+<label>Filament profile (from Orca)
+  <select id="profile" onchange="applyProfile()">
+{options_html}
+  </select>
+</label>
+<label>Filament display name (shown in the AMS picker)<input id="name" value=""></label>
+<label>Type (PLA / PETG / ABS / TPU / PETG-CF / ...)<input id="type" value=""></label>
+<label>Vendor<input id="vendor" value=""></label>
+<label>Nozzle temp min (C)<input id="temp_min" type="number" value=""></label>
+<label>Nozzle temp max (C)<input id="temp_max" type="number" value=""></label>
 <label>filament_id (must be unique, e.g. GFL999)<input id="filament_id" value="GFL999"></label>
 <label>setting_id (e.g. GFSL999)<input id="setting_id" value="GFSL999"></label>
 <button onclick="submitForm()">Push to AMS</button>
 <script>
-function submitForm() {
-  orca.submit({
+var PROFILES = {profiles_json};
+
+function applyProfile() {{
+  var name = document.getElementById('profile').value;
+  var p = PROFILES[name];
+  if (!p) return;
+  document.getElementById('name').value = name;
+  document.getElementById('type').value = p.type || '';
+  document.getElementById('vendor').value = p.vendor || '';
+  document.getElementById('temp_min').value = p.temp_min || '';
+  document.getElementById('temp_max').value = p.temp_max || '';
+}}
+
+function submitForm() {{
+  orca.submit({{
     host: document.getElementById('host').value,
     password: document.getElementById('password').value,
     name: document.getElementById('name').value,
@@ -308,8 +363,17 @@ function submitForm() {
     temp_max: document.getElementById('temp_max').value,
     filament_id: document.getElementById('filament_id').value,
     setting_id: document.getElementById('setting_id').value,
-  });
-}
+  }});
+}}
+
+// Prefill from the currently-selected Orca preset, if any, on open.
+(function() {{
+  var defaultName = {default_name_json};
+  if (defaultName && PROFILES[defaultName]) {{
+    document.getElementById('profile').value = defaultName;
+    applyProfile();
+  }}
+}})();
 </script>
 </body></html>
 """
@@ -328,14 +392,13 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
                 "dependency (see the note at the top of this file).",
             )
 
-        prefill = _prefill_from_preset()
-        prefill.setdefault("host", "")
+        profiles, default_name = _list_filament_profiles()
 
         orca.host.ui.create_window(
-            html=PUSH_DIALOG_HTML % prefill,
+            html=_build_push_dialog_html(profiles, default_name),
             title="Push filament to X1Plus AMS",
-            width=420,
-            height=560,
+            width=460,
+            height=640,
             style=orca.host.ui.WINDOW_MODAL,
             on_submit=self._on_submit,
             on_close=lambda: None,
