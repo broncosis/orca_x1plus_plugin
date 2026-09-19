@@ -1,29 +1,28 @@
 # /// script
+# dependencies = ["paramiko"]
+#
 # [tool.orcaslicer.plugin]
 # name = "X1Plus Filament Push"
 # description = "Push a custom filament profile into an X1Plus-modified printer's AMS catalog over SSH"
-# dependencies = ["paramiko"]
 # ///
 #
-# NOTE FOR TOMORROW: this file is unverified against a real Orca Slicer
-# runtime -- I built it from OrcaSlicer's published plugin API docs, but I
-# have no way to actually run Orca myself. The three things most likely to
-# need adjusting once you load this into Orca and try it:
-#   1. The exact attribute names on orca.host.preset_bundle() for reading
-#      the currently-selected filament preset (see _prefill_from_preset()
-#      below -- it's wrapped in a broad try/except specifically so a
-#      wrong guess there just means blank fields, not a crash).
-#   2. orca.host.ui.show_dialog()'s exact JS bridge -- I'm using
-#      orca.submit({...}) inside the HTML per the documented API, but
-#      double check the console if the dialog doesn't return data.
-#   3. Whether Orca's embedded interpreter actually resolves the PEP 723
-#      `dependencies = ["paramiko"]` line automatically, or whether
-#      paramiko needs to be pip-installed into whatever environment Orca's
-#      interpreter uses. If the plugin fails to import paramiko, that's
-#      the first thing to check.
+# Verified against the real OrcaSlicer plugin-host source (not just docs):
+#   - `dependencies` must live in the PEP 723 root section, not nested inside
+#     [tool.orcaslicer.plugin] -- Orca's TOML parser only reads it there.
+#   - There is no synchronous `orca.host.ui.show_dialog()`. The real API is
+#     `orca.host.ui.create_window(html, title, width, height, on_submit,
+#     on_close, style)`, which is asynchronous: it returns immediately and
+#     delivers the submitted form data via the on_submit callback. execute()
+#     must not block waiting for it (it runs on the main/UI thread; blocking
+#     here would stop the window's own JS bridge callback from ever being
+#     dispatched). So execute() opens the window and returns; the actual
+#     deploy work happens inside the on_submit callback, in a background
+#     thread, same as before.
+#   - `orca.ExecutionResult.failure()` requires a leading `orca.PluginResult`
+#     status enum argument, not just a message string.
 #
 # The SSH/merge/push logic itself (X1PlusDeployer below) is the same code
-# as x1plus_deploy.py, which HAS been tested offline against your real
+# as x1plus_deploy.py, which has been tested offline against a real
 # extracted filament catalog and the real .sig file's header format --
 # that part is solid. This file just wraps it in Orca's plugin UI.
 
@@ -245,6 +244,37 @@ def _prefill_from_preset():
     return prefill
 
 
+def _run_with_progress(title, work_fn):
+    """Run work_fn(progress_cb) on a background thread while pumping a
+    pulsing progress dialog on the calling (main/UI) thread. Returns
+    (error_str_or_None). work_fn must not touch any UI objects itself --
+    only call progress_cb(str)."""
+    style = orca.host.ui.PD_APP_MODAL | orca.host.ui.PD_AUTO_HIDE
+    status = {"msg": "Connecting...", "done": False, "error": None}
+
+    def progress_cb(msg):
+        status["msg"] = msg
+
+    def worker():
+        try:
+            work_fn(progress_cb)
+        except Exception as e:
+            status["error"] = str(e)
+        finally:
+            status["done"] = True
+
+    with orca.host.ui.create_progress_dialog(title, status["msg"], maximum=0, style=style) as progress_dlg:
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        while not status["done"]:
+            if not progress_dlg.pulse(status["msg"]):
+                status["error"] = "Cancelled"
+                break
+            t.join(timeout=0.2)
+
+    return status["error"]
+
+
 PUSH_DIALOG_HTML = """
 <html><body style="font-family: var(--orca-font); background: var(--orca-bg); color: var(--orca-fg); padding: 12px;">
 <style>
@@ -292,29 +322,35 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
     def execute(self):
         if paramiko is None:
             return orca.ExecutionResult.failure(
+                orca.PluginResult.FatalError,
                 "paramiko isn't available in Orca's plugin environment -- "
-                "see the note at the top of this file (item 3)."
+                "check that the bundled uv installer resolved the PEP 723 "
+                "dependency (see the note at the top of this file).",
             )
 
         prefill = _prefill_from_preset()
         prefill.setdefault("host", "")
 
-        result = orca.host.ui.show_dialog(
+        orca.host.ui.create_window(
             html=PUSH_DIALOG_HTML % prefill,
             title="Push filament to X1Plus AMS",
             width=420,
             height=560,
+            style=orca.host.ui.WINDOW_MODAL,
+            on_submit=self._on_submit,
+            on_close=lambda: None,
         )
-        if not result:
-            return orca.ExecutionResult.skipped("Cancelled")
+        # create_window is async -- the real work happens in _on_submit once
+        # the user submits the form. Nothing to wait for here.
+        return orca.ExecutionResult.success("Dialog opened")
 
-        deployer = X1PlusDeployer(result["host"])
-
+    def _on_submit(self, result):
         try:
             temp_min = int(result["temp_min"])
             temp_max = int(result["temp_max"])
-        except ValueError:
-            return orca.ExecutionResult.failure("Nozzle temps must be numbers")
+        except (KeyError, ValueError):
+            orca.host.ui.message("Nozzle temps must be numbers", title="X1Plus Filament Push")
+            return
 
         new_entry = {
             result["name"]: {
@@ -330,38 +366,23 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
             }
         }
 
-        style = orca.host.ui.PD_APP_MODAL | orca.host.ui.PD_AUTO_HIDE
-        with orca.host.ui.create_progress_dialog("X1Plus Filament Push", "Connecting...", maximum=0, style=style) as progress_dlg:
-            status = {"msg": "Connecting...", "done": False, "error": None}
+        deployer = X1PlusDeployer(result["host"])
 
-            def progress_cb(msg):
-                status["msg"] = msg
+        def work(progress_cb):
+            if result.get("password"):
+                deployer.bootstrap(result["password"], progress=progress_cb)
+            elif not deployer.key_login_works():
+                raise RuntimeError(
+                    "No stored key works yet for this printer, and no password "
+                    "was given. Enter the root password once to bootstrap."
+                )
+            deployer.push(new_entry, progress=progress_cb)
 
-            def worker():
-                try:
-                    if result.get("password"):
-                        deployer.bootstrap(result["password"], progress=progress_cb)
-                    elif not deployer.key_login_works():
-                        status["error"] = ("No stored key works yet for this printer, and no password "
-                                            "was given. Enter the root password once to bootstrap.")
-                        status["done"] = True
-                        return
-                    deployer.push(new_entry, progress=progress_cb)
-                except Exception as e:
-                    status["error"] = str(e)
-                finally:
-                    status["done"] = True
-
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            while not status["done"]:
-                if not progress_dlg.pulse(status["msg"]):
-                    return orca.ExecutionResult.skipped("Cancelled")
-                t.join(timeout=0.2)
-
-        if status["error"]:
-            return orca.ExecutionResult.failure(status["error"])
-        return orca.ExecutionResult.success(f"Pushed {result['name']!r} to the AMS catalog")
+        error = _run_with_progress("X1Plus Filament Push", work)
+        if error:
+            orca.host.ui.message(error, title="X1Plus Filament Push failed")
+        else:
+            orca.host.ui.message(f"Pushed {result['name']!r} to the AMS catalog", title="X1Plus Filament Push")
 
 
 class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
@@ -370,7 +391,10 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
 
     def execute(self):
         if paramiko is None:
-            return orca.ExecutionResult.failure("paramiko isn't available in Orca's plugin environment")
+            return orca.ExecutionResult.failure(
+                orca.PluginResult.FatalError,
+                "paramiko isn't available in Orca's plugin environment",
+            )
 
         html = """
         <html><body style="font-family: var(--orca-font); background: var(--orca-bg); color: var(--orca-fg); padding: 12px;">
@@ -379,16 +403,28 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
         <button onclick="orca.submit({host: document.getElementById('host').value, password: document.getElementById('password').value})">Bootstrap</button>
         </body></html>
         """
-        result = orca.host.ui.show_dialog(html=html, title="X1Plus: SSH key setup", width=360, height=220)
+        orca.host.ui.create_window(
+            html=html,
+            title="X1Plus: SSH key setup",
+            width=360,
+            height=220,
+            style=orca.host.ui.WINDOW_MODAL,
+            on_submit=self._on_submit,
+            on_close=lambda: None,
+        )
+        return orca.ExecutionResult.success("Dialog opened")
+
+    def _on_submit(self, result):
         if not result or not result.get("password"):
-            return orca.ExecutionResult.skipped("Cancelled")
+            orca.host.ui.message("A root password is required to bootstrap.", title="X1Plus: SSH key setup")
+            return
 
         deployer = X1PlusDeployer(result["host"])
-        try:
-            deployer.bootstrap(result["password"])
-        except Exception as e:
-            return orca.ExecutionResult.failure(str(e))
-        return orca.ExecutionResult.success(f"SSH key installed on {result['host']}")
+        error = _run_with_progress("X1Plus: SSH key setup", lambda progress_cb: deployer.bootstrap(result["password"], progress=progress_cb))
+        if error:
+            orca.host.ui.message(error, title="X1Plus: SSH key setup failed")
+        else:
+            orca.host.ui.message(f"SSH key installed on {result['host']}", title="X1Plus: SSH key setup")
 
 
 @orca.plugin
