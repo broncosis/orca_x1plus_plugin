@@ -209,32 +209,53 @@ class X1PlusDeployer:
             "Settings > Version > Filament database > download, then try again."
         )
 
-    def _merge(self, catalog_zip_bytes, new_entries):
+    def _merge(self, catalog_zip_bytes, new_entries, confirm_overwrite=None):
+        """confirm_overwrite(new_display_name, filament_id, existing_display_name) -> bool.
+        Called when a NEW display name's filament_id collides with an
+        EXISTING, DIFFERENTLY-NAMED catalog entry (updating the same
+        display name is never a collision and never calls this). True
+        proceeds, replacing that existing entry -- its old display-name
+        key is removed so the catalog doesn't end up with two entries
+        sharing one filament_id. False (or no callback given) raises,
+        aborting the push. The decision is cached per filament_id for this
+        call, so pushing across all four nozzle-diameter files only
+        prompts once even when the same collision appears in each."""
         src = zipfile.ZipFile(io.BytesIO(catalog_zip_bytes))
         names = [n for n in src.namelist() if n in NOZZLE_FILES]
         if not names:
             raise RuntimeError(f"expected nozzle files not found (got {src.namelist()})")
+        decisions = {}
         out_buf = io.BytesIO()
         with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out:
             for name in names:
                 catalog = json.loads(src.read(name))
-                existing_ids = {v["filament_id"] for k, v in catalog.items() if k not in new_entries}
                 for disp_name, entry in new_entries.items():
-                    if entry["filament_id"] in existing_ids:
+                    fid = entry["filament_id"]
+                    colliding_name = next(
+                        (k for k, v in catalog.items() if k not in new_entries and v.get("filament_id") == fid),
+                        None,
+                    )
+                    if colliding_name is None:
+                        continue
+                    if fid not in decisions:
+                        decisions[fid] = confirm_overwrite(disp_name, fid, colliding_name) if confirm_overwrite else False
+                    if not decisions[fid]:
                         raise RuntimeError(
-                            f"filament_id {entry['filament_id']!r} collides with an existing entry in {name}"
+                            f"filament_id {fid!r} collides with existing entry {colliding_name!r} in {name}, "
+                            f"and the overwrite wasn't confirmed"
                         )
+                    del catalog[colliding_name]
                 catalog.update(new_entries)
                 out.writestr(name, json.dumps(catalog))
         return out_buf.getvalue()
 
-    def push(self, new_entries, progress=None):
+    def push(self, new_entries, progress=None, confirm_overwrite=None):
         client = self._connect_key()
         try:
             catalog_zip = self._fetch_active_catalog(client, progress)
             if progress:
                 progress(f"Merging in: {', '.join(new_entries.keys())}")
-            merged = self._merge(catalog_zip, new_entries)
+            merged = self._merge(catalog_zip, new_entries, confirm_overwrite=confirm_overwrite)
 
             self._run(client, f"mkdir -p {REMOTE_DEPLOY_DIR}")
             if progress:
@@ -506,6 +527,17 @@ def _list_filament_profiles():
                 fallback_filament_id, fallback_setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
                 filament_id = filament_id or fallback_filament_id
                 setting_id = setting_id or fallback_setting_id
+            if filament_id and not setting_id:
+                # setting_id is Bambu's cloud-settings-database id -- Orca
+                # never assigns one to a preset with no official Bambu
+                # catalog lineage (confirmed: present in the resolved
+                # config as a literal null for a from-scratch custom
+                # filament, not merely unfound). Our own collision check
+                # only ever validates filament_id, never setting_id, so
+                # reusing filament_id here is a safe, always-populated
+                # stand-in -- better than the generic GFSL999 placeholder,
+                # which is easy to forget to change across different pushes.
+                setting_id = filament_id
             profiles[name] = {
                 "type": preset.config_value("filament_type") or "",
                 "vendor": preset.config_value("filament_vendor") or "",
@@ -725,6 +757,20 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
 
         deployer = X1PlusDeployer(result["host"])
 
+        def confirm_overwrite(new_name, filament_id, existing_name):
+            # orca.host.ui.message() is safe to call off the main thread --
+            # it marshals to the UI thread and blocks the caller until
+            # answered (confirmed against source, run_on_ui_blocking()) --
+            # and this callback runs on the background worker thread below.
+            answer = orca.host.ui.message(
+                f"filament_id {filament_id!r} is already used by the existing "
+                f"AMS catalog entry {existing_name!r}.\n\n"
+                f"Overwrite it with {new_name!r}?",
+                title="X1Plus Filament Push: id collision",
+                buttons="yes_no",
+            )
+            return answer == "yes"
+
         def work(progress_cb):
             if result.get("password"):
                 deployer.bootstrap(result["password"], progress=progress_cb)
@@ -733,7 +779,7 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
                     "No stored key works yet for this printer, and no password "
                     "was given. Enter the root password once to bootstrap."
                 )
-            deployer.push(new_entry, progress=progress_cb)
+            deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_overwrite)
 
         error = _run_with_progress("X1Plus Filament Push", work)
         if error:
