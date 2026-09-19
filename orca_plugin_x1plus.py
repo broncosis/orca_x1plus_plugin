@@ -210,16 +210,20 @@ class X1PlusDeployer:
         )
 
     def _merge(self, catalog_zip_bytes, new_entries, confirm_overwrite=None):
-        """confirm_overwrite(new_display_name, filament_id, existing_display_name) -> bool.
-        Called when a NEW display name's filament_id collides with an
-        EXISTING, DIFFERENTLY-NAMED catalog entry (updating the same
-        display name is never a collision and never calls this). True
-        proceeds, replacing that existing entry -- its old display-name
-        key is removed so the catalog doesn't end up with two entries
-        sharing one filament_id. False (or no callback given) raises,
-        aborting the push. The decision is cached per filament_id for this
-        call, so pushing across all four nozzle-diameter files only
-        prompts once even when the same collision appears in each."""
+        """confirm_overwrite(question: str) -> bool. Called with a
+        human-readable question when a NEW display name's filament_id
+        collides with an EXISTING, DIFFERENTLY-NAMED catalog entry
+        (updating the same display name is never a collision and never
+        calls this). True proceeds, replacing that existing entry -- its
+        old display-name key is removed so the catalog doesn't end up with
+        two entries sharing one filament_id. False (or no callback given)
+        raises, aborting the push. The decision is cached per filament_id
+        for this call, so pushing across all four nozzle-diameter files
+        only prompts once even when the same collision appears in each.
+
+        confirm_overwrite must not touch UI objects directly if this runs
+        on a background thread -- see _run_with_progress's confirm_cb,
+        which this is designed to receive."""
         src = zipfile.ZipFile(io.BytesIO(catalog_zip_bytes))
         names = [n for n in src.namelist() if n in NOZZLE_FILES]
         if not names:
@@ -238,7 +242,11 @@ class X1PlusDeployer:
                     if colliding_name is None:
                         continue
                     if fid not in decisions:
-                        decisions[fid] = confirm_overwrite(disp_name, fid, colliding_name) if confirm_overwrite else False
+                        question = (
+                            f"filament_id {fid!r} is already used by the existing AMS catalog "
+                            f"entry {colliding_name!r}.\n\nOverwrite it with {disp_name!r}?"
+                        )
+                        decisions[fid] = confirm_overwrite(question) if confirm_overwrite else False
                     if not decisions[fid]:
                         raise RuntimeError(
                             f"filament_id {fid!r} collides with existing entry {colliding_name!r} in {name}, "
@@ -557,19 +565,50 @@ def _list_filament_profiles():
 
 
 def _run_with_progress(title, work_fn):
-    """Run work_fn(progress_cb) on a background thread while pumping a
-    pulsing progress dialog on the calling (main/UI) thread. Returns
-    (error_str_or_None). work_fn must not touch any UI objects itself --
-    only call progress_cb(str)."""
+    """Run work_fn(progress_cb, confirm_cb) on a background thread while
+    pumping a pulsing progress dialog on the calling (main/UI) thread.
+    Returns (error_str_or_None). work_fn must not touch any UI objects
+    itself -- only call progress_cb(str) and, if it needs to ask a
+    yes/no question, confirm_cb(str) -> bool.
+
+    confirm_cb does NOT call orca.host.ui.message() directly from the
+    worker thread -- that would deadlock. message() marshals to the main
+    thread via a wx CallAfter + blocks the caller on a future, which is
+    fine when the main thread is running wx's own event loop, but ours
+    isn't: this function's own polling loop (pulse() + join()) runs
+    synchronously ON the main thread without ever returning to wx's real
+    MainLoop, so the CallAfter it schedules would never get dispatched --
+    both threads would wait on each other forever. Confirmed by reading
+    pulse()'s own implementation: it's just run_on_ui_blocking() called
+    inline (since it's already on the main thread), which does nothing to
+    pump unrelated queued events. Observed as a genuine hang in testing,
+    not a hypothetical.
+
+    Instead, confirm_cb signals a request via a threading.Event and
+    blocks the WORKER thread waiting for an answer; this loop -- which
+    really is on the main thread, and isn't blocked, just polling -- sees
+    the request on its next iteration and shows the dialog itself (safe:
+    run_on_ui_blocking() runs it inline when already on the main thread),
+    then signals the answer back."""
     style = orca.host.ui.PD_APP_MODAL | orca.host.ui.PD_AUTO_HIDE
-    status = {"msg": "Connecting...", "done": False, "error": None}
+    status = {"msg": "Connecting...", "done": False, "error": None,
+              "confirm_question": None, "confirm_answer": None}
+    confirm_requested = threading.Event()
+    confirm_answered = threading.Event()
 
     def progress_cb(msg):
         status["msg"] = msg
 
+    def confirm_cb(question):
+        status["confirm_question"] = question
+        confirm_answered.clear()
+        confirm_requested.set()
+        confirm_answered.wait()
+        return status["confirm_answer"]
+
     def worker():
         try:
-            work_fn(progress_cb)
+            work_fn(progress_cb, confirm_cb)
         except Exception as e:
             status["error"] = str(e)
         finally:
@@ -579,6 +618,14 @@ def _run_with_progress(title, work_fn):
         t = threading.Thread(target=worker, daemon=True)
         t.start()
         while not status["done"]:
+            if confirm_requested.is_set():
+                confirm_requested.clear()
+                question = status["confirm_question"]
+                status["confirm_answer"] = bool(
+                    question is not None and orca.host.ui.message(question, title=title, buttons="yes_no") == "yes"
+                )
+                confirm_answered.set()
+                continue
             if not progress_dlg.pulse(status["msg"]):
                 status["error"] = "Cancelled"
                 break
@@ -757,21 +804,10 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
 
         deployer = X1PlusDeployer(result["host"])
 
-        def confirm_overwrite(new_name, filament_id, existing_name):
-            # orca.host.ui.message() is safe to call off the main thread --
-            # it marshals to the UI thread and blocks the caller until
-            # answered (confirmed against source, run_on_ui_blocking()) --
-            # and this callback runs on the background worker thread below.
-            answer = orca.host.ui.message(
-                f"filament_id {filament_id!r} is already used by the existing "
-                f"AMS catalog entry {existing_name!r}.\n\n"
-                f"Overwrite it with {new_name!r}?",
-                title="X1Plus Filament Push: id collision",
-                buttons="yes_no",
-            )
-            return answer == "yes"
-
-        def work(progress_cb):
+        def work(progress_cb, confirm_cb):
+            # confirm_cb is _run_with_progress's thread-safe handoff -- it
+            # must NOT be replaced with a direct orca.host.ui.message()
+            # call here, that would deadlock (see _run_with_progress).
             if result.get("password"):
                 deployer.bootstrap(result["password"], progress=progress_cb)
             elif not deployer.key_login_works():
@@ -779,7 +815,7 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
                     "No stored key works yet for this printer, and no password "
                     "was given. Enter the root password once to bootstrap."
                 )
-            deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_overwrite)
+            deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
 
         error = _run_with_progress("X1Plus Filament Push", work)
         if error:
@@ -832,7 +868,10 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
             return
 
         deployer = X1PlusDeployer(result["host"])
-        error = _run_with_progress("X1Plus: SSH key setup", lambda progress_cb: deployer.bootstrap(result["password"], progress=progress_cb))
+        error = _run_with_progress(
+            "X1Plus: SSH key setup",
+            lambda progress_cb, confirm_cb: deployer.bootstrap(result["password"], progress=progress_cb),
+        )
         if error:
             orca.host.ui.message(error, title="X1Plus: SSH key setup failed")
         else:
