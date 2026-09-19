@@ -109,16 +109,10 @@ class X1PlusDeployer:
             raise RuntimeError(f"remote command failed ({exit_status}): {command}\n{out}\n{err}")
         return exit_status, out, err
 
-    def key_login_works(self):
-        try:
-            c = self._connect_key()
-            c.close()
-            return True
-        except Exception:
-            return False
-
     def bootstrap(self, password, progress=None):
         _, pubkey_line = self._ensure_keypair()
+        if progress:
+            progress(f"Connecting to {self.host}...")
         client = self._connect_password(password)
         try:
             self._run(client, "mkdir -p /root/.ssh && chmod 700 /root/.ssh")
@@ -258,6 +252,8 @@ class X1PlusDeployer:
         return out_buf.getvalue()
 
     def push(self, new_entries, progress=None, confirm_overwrite=None):
+        if progress:
+            progress(f"Connecting to {self.host}...")
         client = self._connect_key()
         try:
             catalog_zip = self._fetch_active_catalog(client, progress)
@@ -810,12 +806,20 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
             # call here, that would deadlock (see _run_with_progress).
             if result.get("password"):
                 deployer.bootstrap(result["password"], progress=progress_cb)
-            elif not deployer.key_login_works():
+                deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
+                return
+            try:
+                deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
+            except paramiko.AuthenticationException:
+                # One connection attempt, not a pre-flight key_login_works()
+                # check plus a second real connect inside push() -- that
+                # used to double the SSH handshake latency (each one easily
+                # 1-3s) before any real work, or the collision prompt,
+                # could even start.
                 raise RuntimeError(
                     "No stored key works yet for this printer, and no password "
                     "was given. Enter the root password once to bootstrap."
                 )
-            deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
 
         error = _run_with_progress("X1Plus Filament Push", work)
         if error:
