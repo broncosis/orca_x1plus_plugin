@@ -83,6 +83,20 @@ REMOTE_DEPLOY_PATH = f"{REMOTE_DEPLOY_DIR}/{REMOTE_DEPLOY_NAME}"
 
 NOZZLE_FILES = ["filament-0.2.json", "filament-0.4.json", "filament-0.6.json", "filament-0.8.json"]
 
+# Confirmed on a real printer: /opt/x1plus/bin is NOT on the PATH that
+# paramiko's exec_command gets (a non-interactive SSH shell doesn't source
+# the profile that sets it up) -- a bare "x1plus" command fails with
+# "command not found" (exit 127), which get_x1plus_setting() below used to
+# silently mistake for "the setting isn't configured".
+X1PLUS_BIN = "/opt/x1plus/bin/x1plus"
+# Official Bambu-signed catalogs land here when downloaded through Bambu's
+# own normal firmware update flow (not X1Plus's override UI) -- this path
+# is NOT tracked by any X1Plus setting and gets wiped on firmware upgrade,
+# but a printer that has never used X1Plus's manual override feature can
+# easily have a valid catalog only here, with both filament.filename and
+# filament.ota_version genuinely unset. Confirmed against a real printer.
+UPGRADE_FILAMENT_DIR = "/userdata/upgrade/filament"
+
 
 # ---------------------------------------------------------------------------
 # Key management
@@ -192,7 +206,7 @@ def bootstrap(host, username="root"):
 
 def get_x1plus_setting(client, key):
     """Returns the parsed JSON value of an X1Plus setting, or None if unset."""
-    exit_status, out, err = run(client, f"x1plus settings get '{key}' --json", check=False)
+    exit_status, out, err = run(client, f"{X1PLUS_BIN} settings get '{key}' --json", check=False)
     if exit_status != 0:
         return None
     try:
@@ -234,6 +248,20 @@ def strip_signature_header(data):
     return data[offset:]
 
 
+def find_upgrade_ota_file(client):
+    """Fallback for a printer that has never used X1Plus's filament override
+    feature: look for whatever official signed catalog Bambu's own firmware
+    last downloaded to UPGRADE_FILAMENT_DIR. Returns the most recently
+    modified match, or None if there isn't one."""
+    exit_status, out, _ = run(
+        client, f"ls -1t {UPGRADE_FILAMENT_DIR}/ota-filament-*.zip.sig 2>/dev/null", check=False
+    )
+    if exit_status != 0:
+        return None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
 def fetch_active_catalog(client):
     """Find and download whatever filament database is currently active
     on the printer, returning it as a plain (header-stripped) zip's bytes."""
@@ -250,8 +278,15 @@ def fetch_active_catalog(client):
         raw = sftp_get_bytes(client, path)
         return strip_signature_header(raw)
 
+    fallback_path = find_upgrade_ota_file(client)
+    if fallback_path:
+        print(f"Neither X1Plus setting is set; using official download at {fallback_path}")
+        raw = sftp_get_bytes(client, fallback_path)
+        return strip_signature_header(raw)
+
     raise RuntimeError(
-        "Neither filament.filename nor filament.ota_version is set on this printer -- "
+        "Neither filament.filename nor filament.ota_version is set on this printer, and no "
+        "official download was found under " + UPGRADE_FILAMENT_DIR + " either -- "
         "there's no known catalog file to start from yet. On the printer's touchscreen, "
         "go to Settings > Version > Filament database and download the official database "
         "once, then re-run this."
@@ -307,7 +342,7 @@ def push(host, new_entries, username="root"):
         sftp_put_bytes(client, REMOTE_DEPLOY_PATH, merged_zip)
 
         print("Pointing filament.filename at the new catalog...")
-        run(client, f"x1plus settings set filament.filename '{REMOTE_DEPLOY_PATH}' --string")
+        run(client, f"{X1PLUS_BIN} settings set filament.filename '{REMOTE_DEPLOY_PATH}' --string")
 
         restart_screen_service(client)
         print("Done. Give the screen ~10-15s, then check the AMS filament picker, "
@@ -321,7 +356,7 @@ def rollback(host, username="root"):
     client = connect_with_key(host, key, username)
     try:
         print("Clearing filament.filename override...")
-        run(client, "x1plus settings set filament.filename '' --null")
+        run(client, f"{X1PLUS_BIN} settings set filament.filename '' --null")
         restart_screen_service(client)
         print("Rolled back to the official downloaded catalog (filament.ota_version).")
     finally:
