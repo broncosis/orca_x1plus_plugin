@@ -16,3 +16,8 @@ filament-0.6.json
 filament-0.8.json
 custom-filament.zip
 filament-db-extracted.zip
+
+# Renamed copies made only for OrcaCloud plugin-hub upload (requires an
+# OS/arch suffix even for a plain .py) -- identical content to
+# orca_plugin_x1plus.py, not worth tracking as a separate file.
+orca_plugin_x1plus_*.py
