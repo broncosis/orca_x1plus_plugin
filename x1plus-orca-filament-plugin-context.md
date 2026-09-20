@@ -565,3 +565,115 @@ Yes/No dialog instead of a scattered per-event prompt at runtime.
   keeps the plain name for development).
 - Status as of this session: upload was in progress, not yet confirmed
   live on the hub.
+
+---
+
+## 14. Confirming the round trip: does Orca resolve a pushed filament back to the right preset?
+
+Once a custom filament is selected on an AMS tray on the touchscreen, does
+Orca (reading the printer's live MQTT state) correctly recognize it as the
+same preset it came from, rather than showing it as unrecognized? Traced
+the full mechanism in source rather than guessing:
+
+1. Printer broadcasts each AMS tray's material identity as `tray_info_idx`
+   in its MQTT device-state message.
+2. `DevFilaSystem.cpp:660`: Orca stores this verbatim into
+   `DevAmsTray::setting_id` (an internal naming choice — despite the field
+   name, the code comment there literally says *"curr_tray->setting_id is
+   our OF [Orca Filament] id"*).
+3. `Plater.cpp:5680`: `wxGetApp().preset_bundle->get_filament_by_filament_id(tray.setting_id)`
+   is called with that value.
+4. `PresetBundle.cpp:938 get_filament_by_filament_id()`: a flat linear scan
+   over every loaded filament preset, returning the first one whose
+   `Preset::filament_id` **exactly string-matches**. No printer-name
+   filter is applied at this call site (that parameter is optional and
+   omitted here).
+
+**Confirmed with real historical evidence, not just theory:** raw MQTT
+payloads already captured earlier in this session (before any of this was
+being deliberately investigated) show `"tray_info_idx":"P5ab7e86"` for a
+tray loaded with "Matter3d PLA Basic" — and `P5ab7e86` is exactly that
+filament's own `filament_id` in `userFilaments`. That's an existing,
+already-working instance of this exact round trip, for a filament Orca
+itself synced via its built-in feature.
+
+**Why this should also hold for our pushes:** `_list_filament_profiles()`
+in `orca_plugin_x1plus.py` sources `filament_id` directly from Orca's own
+already-loaded preset for whichever profile you pick in the dropdown (via
+the subprocess-based reader, §11) — it is not a fabricated new value. So
+the chain is: Orca's own preset for "Jayo PETG basic" already has
+`filament_id == "P61bde26"` in memory → we push `"P61bde26"` into
+`userFilaments` under that same name → printer reports
+`tray_info_idx: "P61bde26"` once that material is selected on a tray →
+`get_filament_by_filament_id("P61bde26")` scans loaded presets and finds
+the same "Jayo PETG basic" preset it originally came from. It should match
+by construction, not by luck — but this has **not yet been visually
+confirmed** end to end (select the pushed filament on a real/virtual AMS
+tray, then check Orca's own AMS panel shows the correct preset name).
+**Next session: do that check.**
+
+Caveat worth remembering: `_generate_filament_id()`-sourced ids (used when
+a profile's own id can't be recovered, or the user leaves the field blank)
+are *not* sourced from any existing Orca preset — a filament pushed that
+way will show up correctly in the AMS picker (confirmed, §10) but will
+**not** round-trip back to a matching Orca preset later, since no local
+preset carries that freshly-generated id. That's an inherent limitation of
+auto-generation, not a bug — there's no existing preset to link back to in
+that case.
+
+---
+
+## 15. Capturing real screenshots of the touchscreen over SSH
+
+No `fbgrab`/`fbcat` on this firmware, but there's a raw framebuffer device
+that works directly:
+
+```
+/dev/fb0 — confirmed 720x1280, 32 bits/pixel, stride 2880 (720*4, no padding)
+```
+
+```python
+import paramiko
+from PIL import Image
+
+client = paramiko.SSHClient()
+client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+client.connect(HOST, username="root", pkey=key, timeout=15, allow_agent=False, look_for_keys=False)
+
+width, height = 720, 1280
+size = width * height * 4
+stdin, stdout, stderr = client.exec_command(f"dd if=/dev/fb0 bs={size} count=1 2>/dev/null")
+raw = stdout.read()  # exactly `size` bytes, confirmed
+client.close()
+
+img = Image.frombuffer("RGBA", (width, height), raw, "raw", "RGBA", 0, 1)
+img.rotate(270, expand=True).save("screenshot.png")  # RGBA channel order + 270° rotation both confirmed correct
+```
+
+- Pixel format is **RGBA** (confirmed by comparing against BGRA — RGBA
+  produced correct, natural colors).
+- The raw buffer is captured in **portrait** orientation and needs a
+  **270°** rotation to match what's physically shown — matches
+  `QT_QPA_LINUXFB_ROTATION=270` found in `bbl_screen`'s own environment
+  (`/proc/<pid>/environ`) back in an earlier session.
+- `dd if=/dev/fb0 bs=<exact size> count=1` reads a single consistent
+  frame; reading via SFTP's `sftp.open()` was not tried and may not work
+  at all against a character device — `exec_command` + raw stdout bytes
+  (do NOT `.decode()`) is the confirmed-working path.
+
+**Used this and found a real, unresolved problem, not just a screenshot:**
+the captured frame showed the X1Plus boot splash, not the normal UI, even
+several seconds after `bbl_screen` had already been running — and
+`uptime` showed the system had been up ~19 hours, ruling out "still on a
+fresh boot." `/var/log/syslog.log` around the same time showed continuous
+`netService: command failed: Operation not permitted` and
+`device_gate: ... pub failed ... @mqtt` errors. Ruled out an actual network
+outage (`wlan0` had the correct IP, `10.0.1.149`, SSH itself worked fine —
+the errors were specifically about `eth0`, which this printer doesn't use
+at all, so likely a red herring) and ruled out a stuck print
+(`ps aux` showed no print/gcode process running, so a power cycle would be
+safe if needed). **Left unresolved, handed to the user to check the
+physical screen and decide on a power cycle** — an SSH-only screen-service
+restart clearly wasn't sufficient to recover it, so if it's really stuck,
+the fix is probably at the printer itself, not something to keep
+attempting remotely.
