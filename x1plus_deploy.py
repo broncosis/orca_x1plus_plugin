@@ -71,8 +71,8 @@ REMOVING AN ENTRY:
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
-import secrets
 import sys
 
 try:
@@ -113,12 +113,20 @@ def ensure_keypair():
     return key, pubkey_line
 
 
-def generate_filament_id():
-    """A locally-unique filament id matching Orca's own observed scheme
-    for user filaments: "P" + 7 lowercase hex characters (e.g. "P6f52551")
-    -- confirmed against real entries already synced to a printer by
-    Orca's own built-in mechanism."""
-    return "P" + secrets.token_hex(4)[:7]
+# Based on work by OrcaSlicer (https://github.com/OrcaSlicer/OrcaSlicer)
+# Original license: AGPL-3.0
+def generate_filament_id(material_name):
+    """Matches Orca's own CreatePresetsDialog.cpp scheme for a from-scratch
+    custom filament: "P" + the first 7 hex chars of MD5(material_name) --
+    confirmed against source, and cross-checked against real entries
+    already synced to a printer by Orca's own built-in mechanism
+    (hashlib.md5("Jayo PETG basic")[:7] reproduces that filament's actual
+    on-printer id, "61bde26", exactly). Deterministic, not random, so a
+    filament pushed this way resolves to the same id Orca itself would
+    assign if the user later creates "the same" filament through Orca's
+    own UI -- see orca_plugin_x1plus.py's _user_filament_id for the fuller
+    story of why this plugin stopped reading ids off a local disk cache."""
+    return "P" + hashlib.md5(material_name.encode("utf-8")).hexdigest()[:7]
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +351,7 @@ def main():
     if args.cmd == "bootstrap":
         bootstrap(args.host, args.username)
     elif args.cmd == "push":
-        filament_id = args.filament_id or generate_filament_id()
+        filament_id = args.filament_id or generate_filament_id(args.name)
         setting_id = args.setting_id or filament_id
         entry = {
             "base_id": None,

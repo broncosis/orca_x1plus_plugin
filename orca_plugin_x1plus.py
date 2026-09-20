@@ -27,13 +27,14 @@
 # that part is solid. This file just wraps it in Orca's plugin UI.
 
 import datetime
+import hashlib
 import html
 import json
 import os
 import re
-import secrets
 import subprocess
 import threading
+import uuid
 
 import orca
 
@@ -482,14 +483,97 @@ def _is_x1_compatible(preset, x1_printer_names):
     return bool(x1_printer_names & set(names))
 
 
-def _generate_filament_id():
-    """A locally-unique filament id matching Orca's own observed scheme
-    for user filaments: "P" + 7 lowercase hex characters (e.g. "P6f52551")
-    -- confirmed against real entries already synced to a printer by
-    Orca's own built-in mechanism. Used when a profile's own id can't be
-    recovered and the user leaves the field blank rather than typing one
-    by hand; a random one is virtually guaranteed not to collide."""
-    return "P" + secrets.token_hex(4)[:7]
+def _material_display_name(preset_name):
+    """Orca's own filament preset names are *not* plain material names --
+    confirmed against the real shipped profiles (e.g.
+    resources/profiles/BBL/filament/eSUN/eSUN PLA+ @BBL X1C 0.2 nozzle.json):
+    Preset::name (what preset_names()/collection.find_preset() key on) is
+    literally "<material> @<printer preset name>[ <nozzle> nozzle]" for
+    essentially every printer-specific system and vendor preset, not just a
+    handful of edge cases (1552 of 1596 BBL filament files use this
+    convention). Using that raw name as the AMS short display name produced
+    the "material name is the entire profile name" bug reported live against
+    a real printer -- e.g. pushing "eSUN PLA+ @BBL X1C 0.2 nozzle" as the
+    key/display name instead of just "eSUN PLA+", then *also* getting
+    another " @Bambu Lab X1 Carbon {nozzle} nozzle" appended on top of that
+    when building the AMS entry's "name" field.
+
+    Also the exact "filament name" input to Orca's own filament_id mint
+    formula (see _system_filament_id) -- matched byte-for-byte against
+    orca_id_tool.py's BASE_NAME_RE (r"\\s?@.*$"), which is why this strips an
+    OPTIONAL leading space before "@" rather than requiring one: Orca's own
+    comment there notes names like "Afinia PLA@HS" exist with no space, and
+    a mismatched regex here would silently mint the wrong id for those."""
+    return re.sub(r"\s?@.*$", "", preset_name)
+
+
+# Based on work by OrcaSlicer (https://github.com/OrcaSlicer/OrcaSlicer)
+# Original license: AGPL-3.0
+#
+# Deterministic filament_id minting, reimplemented from OrcaSlicer's own
+# source (scripts/orca_id_tool.py's generate_filament_id, and
+# CreatePresetsDialog.cpp's calculate_md5-based user-filament scheme) --
+# NOT guessed. Necessary because a filament this plugin pushed by reading a
+# cached/resolved id off disk turned out to carry a PRE-MIGRATION id:
+# OrcaSlicer's system filament catalog moved to content-addressed "OF..."
+# ids (docs/HLSD/filament_id.md: "No vendor is exempt from the filament_id
+# rule"), but this plugin's disk-cache read (_read_ids_from_base_cache /
+# _read_catalog_ids_from_preset_file, still used below only for setting_id)
+# doesn't get invalidated when Orca's own catalog re-mints -- confirmed live
+# against a real printer: every filament already pushed there carried the
+# OLD "P" + md5(name)[:7] scheme, which no longer matches any currently
+# loaded system preset, so Orca's own AMS panel silently falls back to
+# matching by material type only (this exact fallback is documented as
+# deliberate: "a tray or record still holding the old value falls back to
+# matching by material type until the user re-selects the filament").
+# Computing the id straight from the (vendor, type, name) triple sidesteps
+# the cache-staleness problem entirely: it's a pure function of data this
+# plugin already reads from Orca's live preset, so it can never go stale
+# the way a cached snapshot can.
+_FILAMENT_ID_NAMESPACE = uuid.uuid5(
+    uuid.UUID("c1f4d9e2-7a3b-5c8d-9e0f-1a2b3c4d5e6f"), "filament_id"
+)
+_BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _base62_tail(n, length):
+    """The low `length` base62 digits of n, most-significant first --
+    matches orca_id_tool.py's _base62_tail exactly (pinned by Orca's own
+    C++ golden vectors, per that function's docstring)."""
+    digits = []
+    for _ in range(length):
+        digits.append(_BASE62_ALPHABET[n % 62])
+        n //= 62
+    return "".join(reversed(digits))
+
+
+def _system_filament_id(vendor, filament_type, material_name):
+    """Reimplements orca_id_tool.py's generate_filament_id(): an "OF" + 6
+    base62 chars id, deterministic from the product triple alone (no salt,
+    no state) -- confirmed byte-for-byte against a real example computed
+    both ways: vendor="Jayo", type="PETG", name="Jayo PETG basic" mints
+    "OFVhARej" here, which is what Orca's own currently-shipped filament
+    library (OrcaFilamentLibrary.opc, confirmed identical between the
+    installed copy and the running AppImage's own bundled copy) would
+    assign that product now -- not the stale "P61bde26" this plugin had
+    been reading off a local disk cache and pushing instead."""
+    key = f"filament_product/{vendor}/{filament_type}/{material_name}"
+    u = uuid.uuid5(_FILAMENT_ID_NAMESPACE, key)
+    return "OF" + _base62_tail(int.from_bytes(u.bytes, "big"), 6)
+
+
+def _user_filament_id(material_name):
+    """Reimplements CreatePresetsDialog.cpp's from-scratch custom-filament
+    id scheme: "P" + the first 7 hex chars of MD5(material_name) --
+    confirmed against source (calculate_md5(vendor_typr_serial).substr(0,
+    7)) and cross-checked against every filament already on a real printer:
+    hashlib.md5("Jayo PETG basic")[:7] reproduces "61bde26" exactly, proving
+    this -- not a random id -- is genuinely how Orca minted it originally.
+    Deterministic, unlike this plugin's old secrets.token_hex()-based
+    fallback, so a filament pushed this way resolves to the same id Orca
+    itself would assign if the user later creates "the same" filament
+    through Orca's own UI."""
+    return "P" + hashlib.md5(material_name.encode("utf-8")).hexdigest()[:7]
 
 
 def _list_filament_profiles():
@@ -502,9 +586,9 @@ def _list_filament_profiles():
     docs.
 
     Returns (profiles, default_name) where profiles maps
-    name -> {"type", "vendor", "temp_min", "temp_max", "filament_id",
-    "setting_id", "is_user"} (the last two are often "" -- see
-    _read_catalog_ids_from_preset_file), and default_name is the
+    name -> {"material_name", "type", "vendor", "temp_min", "temp_max",
+    "filament_id", "setting_id", "is_user"} (the last two are often "" --
+    see _read_catalog_ids_from_preset_file), and default_name is the
     currently-selected preset's name (or "" if that can't be determined, or
     if it got filtered out -- not fatal, the dropdown just opens
     unselected)."""
@@ -522,14 +606,32 @@ def _list_filament_profiles():
             if x1_printer_names and not _is_x1_compatible(preset, x1_printer_names):
                 continue
             preset_file = getattr(preset, "file", "")
-            filament_id, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names, dir_cache)
-            if not filament_id or not setting_id:
-                fallback_filament_id, fallback_setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
-                filament_id = filament_id or fallback_filament_id
-                setting_id = setting_id or fallback_setting_id
-            if filament_id and not setting_id:
-                # setting_id is Bambu's cloud-settings-database id -- Orca
-                # never assigns one to a preset with no official Bambu
+            is_user = bool(preset.is_user())
+            material_name = _material_display_name(name)
+            ftype = preset.config_value("filament_type") or ""
+            vendor = preset.config_value("filament_vendor") or ""
+
+            # filament_id is computed, not read off disk -- see
+            # _system_filament_id/_user_filament_id docstrings for why a
+            # disk-cached value goes stale across an Orca filament-id
+            # migration (confirmed live: this is what was actually broken).
+            if is_user:
+                filament_id = _user_filament_id(material_name)
+            elif vendor and ftype:
+                filament_id = _system_filament_id(vendor, ftype, material_name)
+            else:
+                filament_id = ""  # missing vendor/type -- can't mint; leave blank
+
+            # setting_id is Bambu's cloud-settings-database id, per-preset
+            # (not per-product like filament_id) and orthogonal to the AMS
+            # tray-matching bug above (get_filament_by_filament_id only
+            # ever checks filament_id) -- still read from disk, still
+            # best-effort, unchanged from before.
+            _, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names, dir_cache)
+            if not setting_id:
+                _, setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
+            if not setting_id:
+                # Orca never assigns one to a preset with no official Bambu
                 # catalog lineage (confirmed: present in the resolved
                 # config as a literal null for a from-scratch custom
                 # filament, not merely unfound). Our own collision check
@@ -539,13 +641,14 @@ def _list_filament_profiles():
                 # which is easy to forget to change across different pushes.
                 setting_id = filament_id
             profiles[name] = {
-                "type": preset.config_value("filament_type") or "",
-                "vendor": preset.config_value("filament_vendor") or "",
+                "material_name": material_name,
+                "type": ftype,
+                "vendor": vendor,
                 "temp_min": preset.config_value("nozzle_temperature_range_low") or "",
                 "temp_max": preset.config_value("nozzle_temperature_range_high") or "",
                 "filament_id": filament_id,
                 "setting_id": setting_id,
-                "is_user": bool(preset.is_user()),
+                "is_user": is_user,
             }
         try:
             default_name = collection.get_selected_preset().name
@@ -708,7 +811,12 @@ function applyProfile() {{
   var name = document.getElementById('profile').value;
   var p = PROFILES[name];
   if (!p) return;
-  document.getElementById('name').value = name;
+  // Orca's preset name for anything printer/vendor-specific is
+  // "<material> @<printer>[ <nozzle> nozzle]" (Preset::name, not a plain
+  // material name) -- use the stripped material_name here so the AMS
+  // display name isn't the whole profile name doubled up with the
+  // "@Bambu Lab X1 Carbon ... nozzle" suffix added below on submit.
+  document.getElementById('name').value = p.material_name || name;
   document.getElementById('type').value = p.type || '';
   document.getElementById('vendor').value = p.vendor || '';
   document.getElementById('temp_min').value = p.temp_min || '';
@@ -799,7 +907,10 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
 
         short_name = result["name"]
         nozzle_diameter = result.get("nozzle_diameter") or "0.4"
-        filament_id = result.get("filament_id") or _generate_filament_id()
+        # _user_filament_id, not a random id: matches what Orca itself would
+        # mint for this material if the user creates "the same" filament
+        # through Orca's own UI later (see its docstring).
+        filament_id = result.get("filament_id") or _user_filament_id(short_name)
         setting_id = result.get("setting_id") or filament_id
         entry = {
             "base_id": None,

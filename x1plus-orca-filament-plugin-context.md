@@ -677,3 +677,152 @@ physical screen and decide on a power cycle** — an SSH-only screen-service
 restart clearly wasn't sufficient to recover it, so if it's really stuck,
 the fix is probably at the printer itself, not something to keep
 attempting remotely.
+
+---
+
+## 16. Bug found: pushed material name was the whole profile name, not just the material
+
+User confirmed live (profiles do land in the AMS picker) but reported the
+display name looked "kind of odd" — the full profile name rather than
+just the material. Root cause confirmed against the real OrcaSlicer source
+tree (`/home/rob/media/coding projects/OrcaSlicer`), not guessed:
+
+- `PluginHostPresets.cpp:95-100`'s `preset_names()` binding returns
+  `Preset::name` verbatim.
+- `Preset::name` for essentially every printer/vendor-specific filament
+  preset is **not** a plain material name — it's
+  `"<material> @<printer preset name>[ <nozzle> nozzle]"`. Confirmed
+  against real shipped files, e.g.
+  `resources/profiles/BBL/filament/eSUN/eSUN PLA+ @BBL X1C 0.2 nozzle.json`
+  (`"name": "eSUN PLA+ @BBL X1C 0.2 nozzle"` inside). 1552 of 1596 files
+  under `BBL/filament/` use this convention — the norm, not an edge case.
+- `_build_push_dialog_html()`'s `applyProfile()` JS was prefilling the
+  editable "Filament display name" field directly from this raw preset
+  name. `_on_submit()` then built the AMS entry's own `"name"` field as
+  `f"{short_name} @Bambu Lab X1 Carbon {nozzle_diameter} nozzle"` — i.e.
+  appending a *second* printer/nozzle suffix on top of the one already
+  baked into the preset name. Net result on the printer: a `userFilaments`
+  key/display name like `"eSUN PLA+ @BBL X1C 0.2 nozzle"` (or worse, with
+  both suffixes stacked in the `"name"` field) instead of just
+  `"eSUN PLA+"`.
+
+**Fix:** added `_material_display_name()` (splits on the literal `" @"`
+delimiter, returns the preset name unchanged if it has no such suffix —
+safe for a plain user-typed custom filament name too). `_list_filament_profiles()`
+now includes a `material_name` field per profile; `applyProfile()` prefills
+the display-name input from that instead of the raw dropdown key. The
+dropdown's own option text/value is left untouched (still the full raw
+preset name, since that's needed to disambiguate nozzle/printer variants
+of the same material in the list, and to key `PROFILES[...]` lookups and
+`find_preset()`). Applied to both `orca_plugin_x1plus.py` and the hub
+upload copy `orca_plugin_x1plus_any.py` (kept byte-identical, as before).
+
+**Not yet re-tested against the live printer** — next session should
+push a filament with a known "@..."-suffixed source profile (e.g. an
+eSUN or Bambu system profile, not just a from-scratch custom one) and
+confirm the AMS picker now shows just the material name.
+
+---
+
+## 17. Bug found: pushed filament_id used a retired Orca id scheme, so the AMS panel fell back to generic
+
+User reported that after selecting a pushed filament on an AMS tray, Orca's
+own AMS/tray panel showed it as a generic material (color and material type
+came through fine, specific product name did not).
+
+Root cause, confirmed against `/home/rob/media/coding projects/OrcaSlicer`
+(the user's own fork, `broncosis/OrcaSlicer`, branch
+`feat/lane-data-filament-id-matching`, sitting on top of a very recent
+`upstream/main` — verified this checkout has real, unmodified upstream
+history via `git branch -r --contains <hash>` before trusting anything read
+from it, since one commit's message ("content-addressed mint tooling,
+succession runtime") initially looked suspicious enough to double-check):
+
+- `docs/HLSD/filament_id.md` (rewritten by upstream commit `4aa0e1d60b`,
+  "Translate filament ids at the printer boundary", 2026-09-06) documents
+  that OrcaSlicer's system filament catalog now assigns every non-BBL
+  vendor filament a content-addressed id: `"OF" + base62_6(uuid5(...,
+  "filament_product/<vendor>/<type>/<name>"))` — "No vendor is exempt from
+  the filament_id rule." This superseded an older scheme (confirmed via
+  `git log -S` on `check_ams_filament_valid`/`get_filament_by_filament_id`,
+  landing in upstream commit `2c0867619c`, 2026-07-04).
+- This plugin's `_read_ids_from_base_cache()` (§9-§11) reads a **locally
+  cached, resolved snapshot** of a filament preset that Orca itself writes
+  lazily and never invalidates against catalog changes. Every filament this
+  plugin (or the user's earlier manual SSH test, §10) had ever pushed to
+  the real printer carried an id from that stale cache — provably the
+  *old*, pre-migration scheme: `hashlib.md5(material_name)[:7]` prefixed
+  with `"P"`, matching `CreatePresetsDialog.cpp`'s actual (deterministic,
+  not random) formula for a from-scratch user filament byte-for-byte
+  against all 19 real entries found on the printer (e.g. `md5("Jayo PETG
+  basic")[:7]` == `"61bde26"`, exactly the id that had been pushed).
+- The doc states the consequence explicitly: *"An id that changes is not
+  forwarded anywhere: a tray or record still holding the old value falls
+  back to matching by material type until the user re-selects the
+  filament."* `PresetBundle::get_filament_by_filament_id()` (still a plain
+  first-match linear scan, per §14) simply finds no loaded preset with the
+  stale id and returns no match, and the surrounding matcher then falls
+  back to a system `Generic <type>` preset by material type — exactly the
+  reported symptom.
+
+**Fix (`orca_plugin_x1plus.py`, `orca_plugin_x1plus_any.py`,
+`x1plus_deploy.py`):** stopped reading `filament_id` from disk entirely.
+Reimplemented Orca's own two minting formulas straight from source
+(`_system_filament_id()` for the `"OF..."` scheme, `_user_filament_id()`
+for the `"P" + md5(...)[:7]` scheme) and compute the id from data this
+plugin already has (`vendor`, `type`, and the material name stripped of its
+`@...` suffix via `_material_display_name()`, now matching Orca's own
+`BASE_NAME_RE` exactly — an optional, not required, leading space before
+`@`). This is immune to cache staleness by construction: it's a pure
+function of the same triple Orca itself hashes, so it can never drift the
+way a lazily-cached snapshot can. `setting_id` (Bambu's separate
+cloud-settings id, confirmed in §14 to never be consulted by the AMS
+matcher) is untouched — still best-effort, still read from the same disk
+cache as before, since it isn't what was actually broken.
+
+**Live remediation:** recomputed and re-pushed the corrected `filament_id`
+for all 19 real entries already on the printer (both `0.4.json` and
+`0.6.json`) in one pass, using each entry's own already-recorded
+`filament_vendor`/`filament_type`/key as the hash input (no need to query
+Orca at all for this part — the data was already sitting in each JSON
+entry). Also removed two more `@`-suffixed bugged-name duplicates
+(`CC3D PC Basic @Bambu Lab X1 Carbon 0.4 nozzle`, pushed a second time
+through the plugin before it had been Reloaded in Orca to pick up the §16
+name fix) rather than trying to salvage them.
+
+**Not yet visually confirmed against the live AMS panel** — next step is
+for the user to Reload the plugin in Orca (picks up both this fix and
+§16's), then check that an existing tray (e.g. Jayo PETG basic) now
+resolves to its real preset instead of a generic one, without needing to
+re-push anything (the corrected ids are already live on the printer).
+
+---
+
+## 18. Actually-leftover bad profile: the abandoned §3 override was never rolled back
+
+User pushed back on §17's cleanup ("you never removed the bad profiles from
+the printer") after the `userFilaments` JSON files had already been
+verified clean (checked `git`-style, i.e. read the files directly, not the
+touchscreen -- the touchscreen itself was separately found stuck on the
+X1Plus boot splash mid-investigation, which turned out to be an unrelated
+red herring the user explicitly redirected away from: "check the files not
+the screen").
+
+Checking wider than just `userFilaments` turned up a real leftover: the
+**§3 mechanism (the signed-catalog-override hook, abandoned in §10 in favor
+of `userFilaments`) had never been rolled back**.
+`x1plus settings get filament.filename --json` still returned
+`"/userdata/cfg/filament/orca-plugin-filament.zip"` -- a stale override
+package dated Sep 19, left over from before the project pivoted mechanisms,
+still referenced by a live X1Plus setting. Cleared it
+(`x1plus settings set filament.filename '' --null`), deleted the leftover
+zip, and restarted the screen service. `filament.ota_version` was never
+set at all (unaffected).
+
+Lesson: when a project pivots away from a mechanism it already deployed
+live, explicitly roll back what was deployed -- `x1plus_deploy.py`'s old
+`rollback` subcommand (cleared `filament.filename`) was dropped when it
+became `remove` (§10), since the new semantics didn't need it for
+`userFilaments` -- but that also meant nothing left ever cleared the
+*old* mechanism's leftover state once the pivot happened, on either the
+real printer or in the tooling.
