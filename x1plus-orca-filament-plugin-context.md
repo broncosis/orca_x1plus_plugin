@@ -826,3 +826,74 @@ became `remove` (§10), since the new semantics didn't need it for
 `userFilaments` -- but that also meant nothing left ever cleared the
 *old* mechanism's leftover state once the pivot happened, on either the
 real printer or in the tooling.
+
+---
+
+## 19. A screenshot dead end, a reload dead end, and a real regression
+
+Three more findings from live-testing §16-§18's fixes against the real
+printer and a real Orca session, in the order they came up:
+
+**The `/dev/fb0` screenshot technique from §15 was reading a dead buffer.**
+Confirmed by checking `bbl_screen`'s own environment and open file
+descriptors on the printer: `QT_QPA_FB_DRM=1` is set, and `/proc/<pid>/fd`
+showed `/dev/dri/card0` open, not `/dev/fb0`. The screen renders through
+DRM/KMS; `/dev/fb0` is never written to by the live UI at all, so every
+`dd if=/dev/fb0` capture this session (and in §15) returned whichever
+static image was last in that buffer at early boot -- not a hang, just the
+wrong device. The user caught this by sending a real phone photo of the
+touchscreen, which showed live, correct content (a per-tray material-edit
+screen) at the exact moment the fb0 grab showed the boot splash. `modetest`
+is present on the printer and confirms the live framebuffer (id 63, AR24,
+720x1280) is allocated by `bbl_screen`, but nothing on-device exists to
+dump it (no `modetest --dump-framebuffers`, no gcc to build a small
+DRM-ioctl dumper, no ffmpeg kmsgrab) -- capturing the *real* screen content
+remotely was not solved this session; the phone-photo workaround is what
+actually worked.
+
+**No "Reload" option in Orca's Plugins dialog.** Traced to
+`evaluate_action_policy()` in `PluginsDialog.cpp`: a plugin registered as a
+*cloud* plugin (subscribed from the OrcaCloud hub -- which this one was,
+per the §13 hub upload) only ever gets a "Reinstall" action, which
+re-pulls from the hub, never a "Reload" that would pick up local file
+edits. "Reload" is local-plugin-only. Fix: delete/unsubscribe the
+cloud-tracked copy in the Plugins dialog (removes only the local install,
+confirmed via the same source not to touch the hub upload), then
+`File > Plugins > Install plugin` pointed at the local `.py` file directly
+-- registers it as a local plugin, which supports Reload for every future
+edit.
+
+**A real regression, self-inflicted.** After landing §17's fix, all 18
+pre-existing `userFilaments` entries had their `filament_id` bulk-rewritten
+to the new `_system_filament_id()` (`"OF..."`) scheme, on the unverified
+assumption that every one of them was an OrcaFilamentLibrary system
+preset. User reported filaments that matched correctly *before* this
+session now also fell back to generic -- i.e. the bulk rewrite made things
+worse, not better. Checking the user's actual Orca profile
+(`~/.config/OrcaSlicer/user/<id>/filament/`) showed the assumption was
+wrong for at least one entry: "CC3D PC Basic" is genuinely user-created
+(no OFL/base-cache lineage), so its correct id is the *other* formula,
+`_user_filament_id()` (`"P" + md5(name)[:7]`) -- confirmed once it was
+re-pushed through the now-fixed plugin (which reads `preset.is_user()`
+live and picks the right formula) and the user confirmed it resolved
+correctly in Orca. The 18 pre-existing entries were reverted to their
+exact original `filament_id` values (captured from this session's own
+earlier verification output, before they were ever overwritten) rather
+than guessed at a second time.
+
+**Lesson, stated plainly:** computing an id from a *catalog entry's own
+recorded* vendor/type/name (as the revert-then-bulk-fix script did) is not
+the same as computing it from the *live, currently loaded Orca preset* (as
+the plugin itself does at push time). The catalog can drift from Orca's
+current presets for reasons that have nothing to do with any bug here --
+e.g. the user renaming or reorganizing presets over time. Also found live:
+the printer's "Matter3d PLA Basic" / "Matter3d PETG proformance" catalog
+entries correspond to real OrcaFilamentLibrary system presets (base-cache
+snapshots only, no delta file -- same pattern as Jayo/eSUN), while the
+user separately has their own **distinct, user-created** "M3d ..." preset
+family (`M3d - Pla Basic`, `M3d pla`, `M3d_Petg`, `M3d
+PETG@stealthchanger`, `M3dPLA @stealthchanger`) that doesn't correspond to
+the catalog names at all. Left for the user to manually consolidate in
+Orca; the correct fix for any of these once sorted out is to re-push
+through the plugin's dropdown (reads the live, post-cleanup preset), never
+to hand-compute or hand-edit a `filament_id` from outside Orca again.
