@@ -13,6 +13,24 @@ cloud-synced on-printer filament database.
 
 ---
 
+## ⚠️ Correction (superseding Section 3 below): wrong mechanism
+
+Everything in Section 3 below (the `filament.filename`/`filament.ota_version`
+override hook, the signature-bypass zip package) was reverse-engineered
+correctly and the write genuinely succeeds — but it turned out **not to be
+what the AMS manual filament picker reads**. Confirmed live against a real
+printer: overriding the official catalog this way had no visible effect on
+the picker at all, while manually adding an entry to
+`/config/screen/userFilaments/<nozzle-diameter>.json` (a much simpler plain
+JSON file, one per nozzle diameter, keyed by short display name) showed up
+immediately. The code has been rewritten around this confirmed-working
+mechanism; see `README.md` for current usage. Section 3 is kept below as a
+research record — it's real, working code for something else, possibly
+useful for a future feature (e.g. affecting RFID-tag-based auto-detection
+rather than the manual picker), just not the answer to the original goal.
+
+---
+
 ## 1. Background: two separate data stores
 
 - **The RFID tag on each spool** (MIFARE Classic 1K, 16 sectors/64 blocks):

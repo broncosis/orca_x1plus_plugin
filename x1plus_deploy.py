@@ -3,11 +3,10 @@
 x1plus_deploy.py — standalone CLI for pushing custom filaments to an
 X1Plus-jailbroken Bambu X1/X1C, no Orca Slicer required.
 
-This is the core logic the Orca plugin will eventually wrap. Test it
-straight from the command line first -- it's the risky, unverified half
-(SSH auth, on-device file format, service restart) and doesn't depend on
-anything about Orca's plugin runtime, which none of us can test outside
-Orca itself.
+This is the core logic the Orca plugin wraps. Test it straight from the
+command line first -- it's the risky, unverified half (SSH auth, on-device
+file format, service restart) and doesn't depend on anything about Orca's
+plugin runtime.
 
 Requires: pip install paramiko
 
@@ -32,38 +31,49 @@ PUSHING A FILAMENT:
 
     python3 x1plus_deploy.py push --host <printer-ip> \
         --name "My Custom PLA" --type PLA --vendor MyBrand \
-        --temp-min 200 --temp-max 230 \
-        --filament-id GFL999 --setting-id GFSL999
+        --temp-min 200 --temp-max 230 --nozzle-diameter 0.4
 
   This will:
     1. connect with the key from bootstrap
-    2. find whatever filament database is currently active on the
-       printer (via the filament.filename / filament.ota_version
-       X1Plus settings), download it
-    3. strip Bambu's signed-package header if present (detected by
-       searching for the zip's PK magic bytes, not a hardcoded offset)
-    4. merge your new entry into all nozzle-diameter JSON files inside it
-    5. upload the merged zip to /userdata/cfg/filament/ on the printer
-       under a name that deliberately does NOT contain ".sig"
-    6. point the filament.filename X1Plus setting at it
-    7. restart the screen service so bbl_screen picks it up
+    2. fetch /config/screen/userFilaments/<nozzle-diameter>.json from the
+       printer (starting fresh with {} if that nozzle diameter has never
+       had a custom filament added -- confirmed on a real printer: only
+       nozzle sizes actually used have a file at all)
+    3. add/update your entry, keyed by --name
+    4. back up the pre-existing file once (<file>.orca-plugin-backup),
+       never overwriting an earlier backup
+    5. upload the updated file
+    6. restart the screen service so bbl_screen picks it up
+
+  This targets /config/screen/userFilaments/, confirmed live against a
+  real printer to be what the AMS manual filament picker actually reads.
+  An earlier version of this tool instead overrode the signed official
+  catalog via X1Plus's filament.filename/.ota_version settings (the
+  mechanism X1Plus PR #477 documents); that write succeeded and the
+  resulting data was verified correct on disk, but had no visible effect
+  on the picker. Manually adding an entry to userFilaments did,
+  immediately -- whatever the official-catalog override actually
+  governs, it isn't the manual picker's material list.
 
 --------------------------------------------------------------------------
-ROLLING BACK:
+REMOVING AN ENTRY:
 
-    python3 x1plus_deploy.py rollback --host <printer-ip>
+    python3 x1plus_deploy.py remove --host <printer-ip> \
+        --name "My Custom PLA" --nozzle-diameter 0.4
 
-  Clears filament.filename and restarts the screen service, returning to
-  whatever filament.ota_version (Bambu's official downloaded catalog)
-  was last set.
+  Deletes that one entry from the userFilaments file (if present) and
+  restarts the screen service. A full-file backup was already made the
+  first time this tool ever wrote to that nozzle diameter's file
+  (<file>.orca-plugin-backup) -- restore it by hand over SSH if you want
+  to undo everything at once rather than one entry at a time.
 """
 
 import argparse
+import datetime
 import getpass
-import io
 import json
+import secrets
 import sys
-import zipfile
 
 try:
     import paramiko
@@ -77,25 +87,8 @@ KEY_DIR = os.path.expanduser("~/.x1plus_orca_plugin")
 PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "id_rsa")
 PUBLIC_KEY_COMMENT = "orca-x1plus-plugin"
 
-REMOTE_DEPLOY_DIR = "/userdata/cfg/filament"
-REMOTE_DEPLOY_NAME = "orca-plugin-filament.zip"  # deliberately no ".sig"
-REMOTE_DEPLOY_PATH = f"{REMOTE_DEPLOY_DIR}/{REMOTE_DEPLOY_NAME}"
-
-NOZZLE_FILES = ["filament-0.2.json", "filament-0.4.json", "filament-0.6.json", "filament-0.8.json"]
-
-# Confirmed on a real printer: /opt/x1plus/bin is NOT on the PATH that
-# paramiko's exec_command gets (a non-interactive SSH shell doesn't source
-# the profile that sets it up) -- a bare "x1plus" command fails with
-# "command not found" (exit 127), which get_x1plus_setting() below used to
-# silently mistake for "the setting isn't configured".
-X1PLUS_BIN = "/opt/x1plus/bin/x1plus"
-# Official Bambu-signed catalogs land here when downloaded through Bambu's
-# own normal firmware update flow (not X1Plus's override UI) -- this path
-# is NOT tracked by any X1Plus setting and gets wiped on firmware upgrade,
-# but a printer that has never used X1Plus's manual override feature can
-# easily have a valid catalog only here, with both filament.filename and
-# filament.ota_version genuinely unset. Confirmed against a real printer.
-UPGRADE_FILAMENT_DIR = "/userdata/upgrade/filament"
+USER_FILAMENTS_DIR = "/config/screen/userFilaments"
+NOZZLE_DIAMETERS = ["0.2", "0.4", "0.6", "0.8"]
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +111,14 @@ def ensure_keypair():
 
     pubkey_line = f"{key.get_name()} {key.get_base64()} {PUBLIC_KEY_COMMENT}"
     return key, pubkey_line
+
+
+def generate_filament_id():
+    """A locally-unique filament id matching Orca's own observed scheme
+    for user filaments: "P" + 7 lowercase hex characters (e.g. "P6f52551")
+    -- confirmed against real entries already synced to a printer by
+    Orca's own built-in mechanism."""
+    return "P" + secrets.token_hex(4)[:7]
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +179,6 @@ def bootstrap(host, username="root"):
         run(client, "mkdir -p /root/.ssh && chmod 700 /root/.ssh")
         # Only append if not already present, so re-running bootstrap is safe.
         check_cmd = f"grep -qxF '{pubkey_line}' /root/.ssh/authorized_keys 2>/dev/null"
-        _, _, _ = run(client, check_cmd, check=False)
         exit_status, _, _ = run(client, check_cmd, check=False)
         if exit_status != 0:
             append_cmd = (
@@ -201,19 +201,8 @@ def bootstrap(host, username="root"):
 
 
 # ---------------------------------------------------------------------------
-# Fetching + merging the on-device filament catalog
+# userFilaments read/write
 # ---------------------------------------------------------------------------
-
-def get_x1plus_setting(client, key):
-    """Returns the parsed JSON value of an X1Plus setting, or None if unset."""
-    exit_status, out, err = run(client, f"{X1PLUS_BIN} settings get '{key}' --json", check=False)
-    if exit_status != 0:
-        return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return None
-
 
 def sftp_get_bytes(client, remote_path):
     sftp = client.open_sftp()
@@ -233,93 +222,25 @@ def sftp_put_bytes(client, remote_path, data):
         sftp.close()
 
 
-def strip_signature_header(data):
-    """Bambu's signed OTA packages are [custom header incl. signature] +
-    [ordinary zip]. Our own previously-pushed overrides are already a
-    plain zip. Handle both by searching for the zip local-file-header
-    magic rather than assuming a fixed offset."""
-    magic = b"PK\x03\x04"
-    offset = data.find(magic)
-    if offset == -1:
-        raise RuntimeError("couldn't find a zip signature (PK\\x03\\x04) anywhere in the fetched file -- "
-                            "this doesn't look like a filament database at all")
-    if offset != 0:
-        print(f"  (stripped {offset}-byte header before the zip payload)")
-    return data[offset:]
-
-
-def find_upgrade_ota_file(client):
-    """Fallback for a printer that has never used X1Plus's filament override
-    feature: look for whatever official signed catalog Bambu's own firmware
-    last downloaded to UPGRADE_FILAMENT_DIR. Returns the most recently
-    modified match, or None if there isn't one."""
-    exit_status, out, _ = run(
-        client, f"ls -1t {UPGRADE_FILAMENT_DIR}/ota-filament-*.zip.sig 2>/dev/null", check=False
-    )
-    if exit_status != 0:
-        return None
-    lines = [line.strip() for line in out.splitlines() if line.strip()]
-    return lines[0] if lines else None
-
-
-def fetch_active_catalog(client):
-    """Find and download whatever filament database is currently active
-    on the printer, returning it as a plain (header-stripped) zip's bytes."""
-    filename_setting = get_x1plus_setting(client, "filament.filename")
-    if filename_setting:
-        print(f"Active override (filament.filename) = {filename_setting}")
-        raw = sftp_get_bytes(client, filename_setting)
-        return strip_signature_header(raw)
-
-    ota_version = get_x1plus_setting(client, "filament.ota_version")
-    if ota_version:
-        path = f"/userdata/cfg/filament/{ota_version}"
-        print(f"No override set; using official downloaded catalog (filament.ota_version) = {ota_version}")
+def fetch_user_filaments(client, nozzle_diameter):
+    """Returns the parsed dict from userFilaments/<nozzle_diameter>.json,
+    or {} if the file doesn't exist yet -- the normal, expected state for
+    a nozzle diameter that's never had a custom filament synced to it
+    (confirmed on a real printer: only sizes actually used have a file at
+    all)."""
+    path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
+    try:
         raw = sftp_get_bytes(client, path)
-        return strip_signature_header(raw)
-
-    fallback_path = find_upgrade_ota_file(client)
-    if fallback_path:
-        print(f"Neither X1Plus setting is set; using official download at {fallback_path}")
-        raw = sftp_get_bytes(client, fallback_path)
-        return strip_signature_header(raw)
-
-    raise RuntimeError(
-        "Neither filament.filename nor filament.ota_version is set on this printer, and no "
-        "official download was found under " + UPGRADE_FILAMENT_DIR + " either -- "
-        "there's no known catalog file to start from yet. On the printer's touchscreen, "
-        "go to Settings > Version > Filament database and download the official database "
-        "once, then re-run this."
-    )
-
-
-def merge_entries(catalog_zip_bytes, new_entries):
-    """Merge new_entries (dict of {display_name: entry_dict}) into every
-    nozzle-diameter JSON file found in catalog_zip_bytes. Returns new zip bytes."""
-    src = zipfile.ZipFile(io.BytesIO(catalog_zip_bytes))
-    names = [n for n in src.namelist() if n in NOZZLE_FILES]
-    if not names:
-        raise RuntimeError(f"none of the expected files {NOZZLE_FILES} were found in the fetched catalog "
-                            f"(found: {src.namelist()})")
-
-    out_buf = io.BytesIO()
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out:
-        for name in names:
-            catalog = json.loads(src.read(name))
-            existing_ids = {v["filament_id"] for k, v in catalog.items() if k not in new_entries}
-            for disp_name, entry in new_entries.items():
-                if entry["filament_id"] in existing_ids:
-                    raise RuntimeError(
-                        f"filament_id {entry['filament_id']!r} for {disp_name!r} collides with an "
-                        f"existing entry in {name}. Pick a different --filament-id/--setting-id."
-                    )
-            catalog.update(new_entries)
-            out.writestr(name, json.dumps(catalog))
-    return out_buf.getvalue()
+    except OSError:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
 
 
 # ---------------------------------------------------------------------------
-# Push + reload
+# Push + remove + reload
 # ---------------------------------------------------------------------------
 
 def restart_screen_service(client):
@@ -327,38 +248,60 @@ def restart_screen_service(client):
     run(client, "/etc/init.d/S99screen_service restart")
 
 
-def push(host, new_entries, username="root"):
+def push(host, short_name, entry, nozzle_diameter, username="root"):
     key, _ = ensure_keypair()
     client = connect_with_key(host, key, username)
     try:
-        print("Fetching the currently active filament catalog...")
-        catalog_zip = fetch_active_catalog(client)
+        remote_path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
+        print(f"Fetching {remote_path} ...")
+        data = fetch_user_filaments(client, nozzle_diameter)
 
-        print(f"Merging in: {', '.join(new_entries.keys())}")
-        merged_zip = merge_entries(catalog_zip, new_entries)
+        if short_name not in data:
+            fid = entry["filament_id"]
+            colliding_name = next((k for k, v in data.items() if v.get("filament_id") == fid), None)
+            if colliding_name is not None:
+                answer = input(
+                    f"filament_id {fid!r} is already used by existing entry {colliding_name!r}. "
+                    f"Add {short_name!r} as a separate entry anyway? [y/N] "
+                )
+                if answer.strip().lower() not in ("y", "yes"):
+                    raise RuntimeError(
+                        f"filament_id {fid!r} collides with existing entry {colliding_name!r}; aborted."
+                    )
 
-        run(client, f"mkdir -p {REMOTE_DEPLOY_DIR}")
-        print(f"Uploading merged catalog to {REMOTE_DEPLOY_PATH} ...")
-        sftp_put_bytes(client, REMOTE_DEPLOY_PATH, merged_zip)
+        data[short_name] = entry
 
-        print("Pointing filament.filename at the new catalog...")
-        run(client, f"{X1PLUS_BIN} settings set filament.filename '{REMOTE_DEPLOY_PATH}' --string")
+        run(client, f"mkdir -p {USER_FILAMENTS_DIR}")
+        # One-time safety net: back up the pre-existing file before ever
+        # overwriting it, but only the first time -- never clobber an
+        # earlier backup with a later (already-modified) copy. Trailing
+        # "; true" so a missing source file or an already-existing backup
+        # (neither an error) doesn't trip run()'s check=True.
+        run(client, f"test -f {remote_path} && test ! -f {remote_path}.orca-plugin-backup && "
+                    f"cp {remote_path} {remote_path}.orca-plugin-backup; true")
+        print(f"Uploading updated {remote_path} ...")
+        sftp_put_bytes(client, remote_path, json.dumps(data, indent=4).encode("utf-8"))
 
         restart_screen_service(client)
-        print("Done. Give the screen ~10-15s, then check the AMS filament picker, "
-              "or Settings > Version > Filament database (should read 'Custom').")
+        print("Done. Give the screen ~10-15s, then check the AMS filament picker.")
     finally:
         client.close()
 
 
-def rollback(host, username="root"):
+def remove(host, short_name, nozzle_diameter, username="root"):
     key, _ = ensure_keypair()
     client = connect_with_key(host, key, username)
     try:
-        print("Clearing filament.filename override...")
-        run(client, f"{X1PLUS_BIN} settings set filament.filename '' --null")
+        remote_path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
+        data = fetch_user_filaments(client, nozzle_diameter)
+        if short_name not in data:
+            print(f"{short_name!r} isn't present in {remote_path} -- nothing to remove.")
+            return
+        del data[short_name]
+        print(f"Uploading updated {remote_path} ...")
+        sftp_put_bytes(client, remote_path, json.dumps(data, indent=4).encode("utf-8"))
         restart_screen_service(client)
-        print("Rolled back to the official downloaded catalog (filament.ota_version).")
+        print(f"Removed {short_name!r} from {remote_path}.")
     finally:
         client.close()
 
@@ -375,46 +318,51 @@ def main():
     p_boot.add_argument("--host", required=True)
     p_boot.add_argument("--username", default="root")
 
-    p_push = sub.add_parser("push", help="merge and push a custom filament entry")
+    p_push = sub.add_parser("push", help="add or update a custom filament in the AMS picker")
     p_push.add_argument("--host", required=True)
     p_push.add_argument("--username", default="root")
-    p_push.add_argument("--name", required=True, help="display name shown in the AMS picker")
+    p_push.add_argument("--name", required=True, help="short display name shown in the AMS picker")
     p_push.add_argument("--type", required=True, help="e.g. PLA, PETG, ABS, TPU, PETG-CF")
     p_push.add_argument("--vendor", required=True)
     p_push.add_argument("--temp-min", type=int, required=True)
     p_push.add_argument("--temp-max", type=int, required=True)
-    p_push.add_argument("--filament-id", required=True, help="must not collide with an existing filament_id")
-    p_push.add_argument("--setting-id", required=True)
+    p_push.add_argument("--nozzle-diameter", choices=NOZZLE_DIAMETERS, default="0.4")
+    p_push.add_argument("--filament-id", help="defaults to an auto-generated unique id if omitted")
+    p_push.add_argument("--setting-id", help="defaults to match --filament-id if omitted")
     p_push.add_argument("--support", action="store_true", help="mark as a support material")
-    p_push.add_argument("--hrc", type=int, default=3, help="required_nozzle_HRC (3=stock nozzle, higher=hardened)")
-    p_push.add_argument("--chamber-temp", type=int, default=0)
-    p_push.add_argument("--vitrification-temp", type=int, default=45)
+    p_push.add_argument("--hrc", type=int, default=3, help="nozzle_hrc (3=stock nozzle, higher=hardened)")
 
-    p_roll = sub.add_parser("rollback", help="remove the override, restart screen")
-    p_roll.add_argument("--host", required=True)
-    p_roll.add_argument("--username", default="root")
+    p_rm = sub.add_parser("remove", help="remove one entry from the AMS picker")
+    p_rm.add_argument("--host", required=True)
+    p_rm.add_argument("--username", default="root")
+    p_rm.add_argument("--name", required=True, help="short display name to remove")
+    p_rm.add_argument("--nozzle-diameter", choices=NOZZLE_DIAMETERS, default="0.4")
 
     args = parser.parse_args()
 
     if args.cmd == "bootstrap":
         bootstrap(args.host, args.username)
     elif args.cmd == "push":
+        filament_id = args.filament_id or generate_filament_id()
+        setting_id = args.setting_id or filament_id
         entry = {
-            args.name: {
-                "type": args.type,
-                "filament_id": args.filament_id,
-                "nozzle_temperature": [args.temp_min, args.temp_max],
-                "filament_is_support": "1" if args.support else "0",
-                "required_nozzle_HRC": args.hrc,
-                "filament_vendor": args.vendor,
-                "setting_id": args.setting_id,
-                "chamber_temperatures": str(args.chamber_temp),
-                "temperature_vitrification": str(args.vitrification_temp),
-            }
+            "base_id": None,
+            "filament_id": filament_id,
+            "filament_is_support": bool(args.support),
+            "filament_type": args.type,
+            "filament_vendor": args.vendor,
+            "inherits": None,
+            "name": f"{args.name} @Bambu Lab X1 Carbon {args.nozzle_diameter} nozzle",
+            "nickname": None,
+            "nozzle_hrc": args.hrc,
+            "nozzle_temperature": [args.temp_min, args.temp_max],
+            "setting_id": setting_id,
+            "update_time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "version": "1.0.0.0",
         }
-        push(args.host, entry, args.username)
-    elif args.cmd == "rollback":
-        rollback(args.host, args.username)
+        push(args.host, args.name, entry, args.nozzle_diameter, args.username)
+    elif args.cmd == "remove":
+        remove(args.host, args.name, args.nozzle_diameter, args.username)
 
 
 if __name__ == "__main__":

@@ -26,14 +26,14 @@
 # extracted filament catalog and the real .sig file's header format --
 # that part is solid. This file just wraps it in Orca's plugin UI.
 
+import datetime
 import html
-import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
-import zipfile
 
 import orca
 
@@ -47,23 +47,17 @@ KEY_DIR = os.path.expanduser("~/.x1plus_orca_plugin")
 PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "id_rsa")
 LAST_HOST_PATH = os.path.join(KEY_DIR, "last_host.txt")
 PUBLIC_KEY_COMMENT = "orca-x1plus-plugin"
-REMOTE_DEPLOY_DIR = "/userdata/cfg/filament"
-REMOTE_DEPLOY_NAME = "orca-plugin-filament.zip"  # deliberately no ".sig"
-REMOTE_DEPLOY_PATH = f"{REMOTE_DEPLOY_DIR}/{REMOTE_DEPLOY_NAME}"
-NOZZLE_FILES = ["filament-0.2.json", "filament-0.4.json", "filament-0.6.json", "filament-0.8.json"]
-# Confirmed on a real printer: /opt/x1plus/bin is NOT on the PATH that
-# paramiko's exec_command gets (a non-interactive SSH shell doesn't source
-# the profile that sets it up) -- a bare "x1plus" command fails with
-# "command not found" (exit 127), which the old code silently mistook for
-# "the setting isn't configured" rather than "the CLI wasn't found at all".
-X1PLUS_BIN = "/opt/x1plus/bin/x1plus"
-# Official Bambu-signed catalogs land here when downloaded through Bambu's
-# own normal firmware update flow (not X1Plus's override UI) -- this path
-# is NOT tracked by any X1Plus setting and gets wiped on firmware upgrade,
-# but a printer that has never used X1Plus's manual override feature can
-# easily have a valid catalog only here, with both filament.filename and
-# filament.ota_version genuinely unset. Confirmed against a real printer.
-UPGRADE_FILAMENT_DIR = "/userdata/upgrade/filament"
+# Confirmed live against a real printer: this is what the AMS manual
+# filament picker actually reads, one plain JSON file per nozzle diameter,
+# keyed by the short display name shown in the picker. An earlier version
+# of this plugin instead overrode the signed OFFICIAL catalog via
+# X1Plus's filament.filename/.ota_version settings (the mechanism X1Plus
+# PR #477 documents) -- that write succeeded and the data was verified
+# correct on disk, but had NO visible effect on the picker. Manually
+# adding an entry here did, immediately. Whatever the official-catalog
+# override actually governs, it isn't the manual picker's material list.
+USER_FILAMENTS_DIR = "/config/screen/userFilaments"
+NOZZLE_DIAMETERS = ["0.2", "0.4", "0.6", "0.8"]
 
 
 class X1PlusDeployer:
@@ -132,23 +126,6 @@ class X1PlusDeployer:
         client = self._connect_key()
         client.close()
 
-    @staticmethod
-    def _strip_signature_header(data):
-        magic = b"PK\x03\x04"
-        offset = data.find(magic)
-        if offset == -1:
-            raise RuntimeError("no zip signature found in fetched filament database")
-        return data[offset:]
-
-    def _get_setting(self, client, key):
-        exit_status, out, _ = self._run(client, f"{X1PLUS_BIN} settings get '{key}' --json", check=False)
-        if exit_status != 0:
-            return None
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return None
-
     def _sftp_get(self, client, path):
         sftp = client.open_sftp()
         try:
@@ -165,110 +142,87 @@ class X1PlusDeployer:
         finally:
             sftp.close()
 
-    def _find_upgrade_ota_file(self, client):
-        """Fallback for a printer that has never used X1Plus's filament
-        override feature: look for whatever official signed catalog Bambu's
-        own firmware last downloaded to UPGRADE_FILAMENT_DIR. Returns the
-        most recently modified match, or None if there isn't one."""
-        exit_status, out, _ = self._run(
-            client, f"ls -1t {UPGRADE_FILAMENT_DIR}/ota-filament-*.zip.sig 2>/dev/null", check=False
-        )
-        if exit_status != 0:
-            return None
-        lines = [line.strip() for line in out.splitlines() if line.strip()]
-        return lines[0] if lines else None
+    def _fetch_user_filaments(self, client, nozzle_diameter):
+        """Returns the parsed dict from userFilaments/<nozzle_diameter>.json,
+        or {} if the file doesn't exist yet. Confirmed on a real printer:
+        a nozzle diameter that's never had a custom filament synced to it
+        has no file at all (only 0.4/0.6 existed, not 0.2/0.8) -- that's
+        the normal, expected first-use case, not an error."""
+        path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
+        try:
+            raw = self._sftp_get(client, path)
+        except OSError:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
 
-    def _fetch_active_catalog(self, client, progress=None):
-        filename_setting = self._get_setting(client, "filament.filename")
-        if filename_setting:
-            if progress:
-                progress(f"Fetching current override: {filename_setting}")
-            return self._strip_signature_header(self._sftp_get(client, filename_setting))
+    def push(self, short_name, entry, nozzle_diameter, progress=None, confirm_overwrite=None):
+        """Add or update one entry in userFilaments/<nozzle_diameter>.json,
+        keyed by short_name -- exactly the string shown in the AMS picker's
+        material list. Confirmed live against a real printer: this file is
+        what the manual filament picker actually reads. An earlier version
+        of this plugin instead overrode the signed official catalog via
+        X1Plus's filament.filename/.ota_version settings; that write
+        succeeded and the resulting data was verified correct on disk, but
+        had no visible effect on the picker -- manually adding an entry
+        here did, immediately.
 
-        ota_version = self._get_setting(client, "filament.ota_version")
-        if ota_version:
-            path = f"/userdata/cfg/filament/{ota_version}"
-            if progress:
-                progress(f"Fetching official catalog: {ota_version}")
-            return self._strip_signature_header(self._sftp_get(client, path))
-
-        fallback_path = self._find_upgrade_ota_file(client)
-        if fallback_path:
-            if progress:
-                progress(f"No X1Plus override set; using official download at {fallback_path}")
-            return self._strip_signature_header(self._sftp_get(client, fallback_path))
-
-        raise RuntimeError(
-            "No filament database found on the printer yet. On the touchscreen: "
-            "Settings > Version > Filament database > download, then try again."
-        )
-
-    def _merge(self, catalog_zip_bytes, new_entries, confirm_overwrite=None):
-        """confirm_overwrite(question: str) -> bool. Called with a
-        human-readable question when a NEW display name's filament_id
-        collides with an EXISTING, DIFFERENTLY-NAMED catalog entry
-        (updating the same display name is never a collision and never
-        calls this). True proceeds, replacing that existing entry -- its
-        old display-name key is removed so the catalog doesn't end up with
-        two entries sharing one filament_id. False (or no callback given)
-        raises, aborting the push. The decision is cached per filament_id
-        for this call, so pushing across all four nozzle-diameter files
-        only prompts once even when the same collision appears in each.
+        confirm_overwrite(question: str) -> bool is called only if a
+        DIFFERENT existing short_name already uses the same filament_id --
+        updating the SAME short_name is never a collision, since
+        short_name is this file's own unique key, so that case is just an
+        ordinary overwrite with no prompt. filament_id here is one of
+        Orca's own locally-generated ids (not a curated, small official
+        namespace like Bambu's GFxxx catalog), so an accidental collision
+        is a hash coincidence, not a routine case -- this exists as a
+        safety net, not an expected everyday prompt.
 
         confirm_overwrite must not touch UI objects directly if this runs
         on a background thread -- see _run_with_progress's confirm_cb,
         which this is designed to receive."""
-        src = zipfile.ZipFile(io.BytesIO(catalog_zip_bytes))
-        names = [n for n in src.namelist() if n in NOZZLE_FILES]
-        if not names:
-            raise RuntimeError(f"expected nozzle files not found (got {src.namelist()})")
-        decisions = {}
-        out_buf = io.BytesIO()
-        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out:
-            for name in names:
-                catalog = json.loads(src.read(name))
-                for disp_name, entry in new_entries.items():
-                    fid = entry["filament_id"]
-                    colliding_name = next(
-                        (k for k, v in catalog.items() if k not in new_entries and v.get("filament_id") == fid),
-                        None,
-                    )
-                    if colliding_name is None:
-                        continue
-                    if fid not in decisions:
-                        question = (
-                            f"filament_id {fid!r} is already used by the existing AMS catalog "
-                            f"entry {colliding_name!r}.\n\nOverwrite it with {disp_name!r}?"
-                        )
-                        decisions[fid] = confirm_overwrite(question) if confirm_overwrite else False
-                    if not decisions[fid]:
-                        raise RuntimeError(
-                            f"filament_id {fid!r} collides with existing entry {colliding_name!r} in {name}, "
-                            f"and the overwrite wasn't confirmed"
-                        )
-                    del catalog[colliding_name]
-                catalog.update(new_entries)
-                out.writestr(name, json.dumps(catalog))
-        return out_buf.getvalue()
-
-    def push(self, new_entries, progress=None, confirm_overwrite=None):
         if progress:
             progress(f"Connecting to {self.host}...")
         client = self._connect_key()
         try:
-            catalog_zip = self._fetch_active_catalog(client, progress)
+            remote_path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
             if progress:
-                progress(f"Merging in: {', '.join(new_entries.keys())}")
-            merged = self._merge(catalog_zip, new_entries, confirm_overwrite=confirm_overwrite)
+                progress(f"Fetching userFilaments/{nozzle_diameter}.json...")
+            data = self._fetch_user_filaments(client, nozzle_diameter)
 
-            self._run(client, f"mkdir -p {REMOTE_DEPLOY_DIR}")
-            if progress:
-                progress("Uploading merged catalog...")
-            self._sftp_put(client, REMOTE_DEPLOY_PATH, merged)
+            if short_name not in data:
+                fid = entry["filament_id"]
+                colliding_name = next((k for k, v in data.items() if v.get("filament_id") == fid), None)
+                if colliding_name is not None:
+                    question = (
+                        f"filament_id {fid!r} is already used by the existing entry "
+                        f"{colliding_name!r}.\n\nAdd {short_name!r} as a separate entry anyway?"
+                    )
+                    if not (confirm_overwrite(question) if confirm_overwrite else False):
+                        raise RuntimeError(
+                            f"filament_id {fid!r} collides with existing entry {colliding_name!r}, "
+                            f"and adding a duplicate wasn't confirmed"
+                        )
 
+            data[short_name] = entry
+
+            self._run(client, f"mkdir -p {USER_FILAMENTS_DIR}")
+            # One-time safety net, mirroring what worked when this was
+            # first verified manually: back up the pre-existing file
+            # before ever overwriting it, but only the first time --
+            # never clobber an earlier backup with a later (already
+            # plugin-modified) copy. Trailing "; true" so a missing
+            # source file or an already-existing backup (neither an
+            # error) doesn't trip _run's check=True.
+            self._run(
+                client,
+                f"test -f {remote_path} && test ! -f {remote_path}.orca-plugin-backup && "
+                f"cp {remote_path} {remote_path}.orca-plugin-backup; true",
+            )
             if progress:
-                progress("Updating filament.filename setting...")
-            self._run(client, f"{X1PLUS_BIN} settings set filament.filename '{REMOTE_DEPLOY_PATH}' --string")
+                progress("Uploading updated userFilaments entry...")
+            self._sftp_put(client, remote_path, json.dumps(data, indent=4).encode("utf-8"))
 
             if progress:
                 progress("Restarting screen service...")
@@ -528,6 +482,16 @@ def _is_x1_compatible(preset, x1_printer_names):
     return bool(x1_printer_names & set(names))
 
 
+def _generate_filament_id():
+    """A locally-unique filament id matching Orca's own observed scheme
+    for user filaments: "P" + 7 lowercase hex characters (e.g. "P6f52551")
+    -- confirmed against real entries already synced to a printer by
+    Orca's own built-in mechanism. Used when a profile's own id can't be
+    recovered and the user leaves the field blank rather than typing one
+    by hand; a random one is virtually guaranteed not to collide."""
+    return "P" + secrets.token_hex(4)[:7]
+
+
 def _list_filament_profiles():
     """Enumerate every filament profile Orca knows about (system presets and
     the user's own custom ones) that's usable on a Bambu X1/X1 Carbon,
@@ -682,12 +646,20 @@ def _profile_options_html(profiles, default_name):
     return "\n".join(parts)
 
 
+def _nozzle_diameter_options_html(default_diameter="0.4"):
+    return "\n".join(
+        f'<option value="{d}"{" selected" if d == default_diameter else ""}>{d} mm</option>'
+        for d in NOZZLE_DIAMETERS
+    )
+
+
 def _build_push_dialog_html(profiles, default_name, default_host=""):
     # Embedded inside a <script> tag, not an HTML attribute, so only the
     # "</script" escape below is needed (no HTML-attribute quoting concerns).
     profiles_json = json.dumps(profiles).replace("</", "<\\/")
     default_name_json = json.dumps(default_name)
     options_html = _profile_options_html(profiles, default_name)
+    nozzle_options_html = _nozzle_diameter_options_html()
     host_attr = html.escape(default_host, quote=True)
 
     return f"""
@@ -712,14 +684,22 @@ def _build_push_dialog_html(profiles, default_name, default_host=""):
 <label>Filament display name (shown in the AMS picker)<input id="name" value=""></label>
 <label>Type (PLA / PETG / ABS / TPU / PETG-CF / ...)<input id="type" value=""></label>
 <label>Vendor<input id="vendor" value=""></label>
+<label>Nozzle diameter
+  <select id="nozzle_diameter">
+{nozzle_options_html}
+  </select>
+  <small>userFilaments is stored one file per nozzle diameter on the
+  printer -- only the size(s) actually used before will already exist;
+  others get created fresh.</small>
+</label>
 <label>Nozzle temp min (C)<input id="temp_min" type="number" value=""></label>
 <label>Nozzle temp max (C)<input id="temp_max" type="number" value=""></label>
-<label>filament_id (must be unique, e.g. GFL999)<input id="filament_id" value="GFL999">
-  <small>Auto-filled only when it could actually be recovered for this
-  profile (not all profiles have a discoverable id -- see project docs).
-  Reusing an EXISTING id here updates that catalog entry; use a new,
-  unused id to add a distinct new one instead.</small></label>
-<label>setting_id (e.g. GFSL999)<input id="setting_id" value="GFSL999"></label>
+<label>filament_id (a unique id, e.g. P1a2b3c4)<input id="filament_id" value=""
+    placeholder="leave blank to auto-generate">
+  <small>Auto-filled when it could be recovered for this profile.
+  Otherwise leave blank -- a unique one will be generated for you (this
+  is Orca's own local id scheme, not Bambu's official catalog).</small></label>
+<label>setting_id (optional)<input id="setting_id" value="" placeholder="leave blank to match filament_id"></label>
 <button onclick="submitForm()">Push to AMS</button>
 <script>
 var PROFILES = {profiles_json};
@@ -734,8 +714,8 @@ function applyProfile() {{
   document.getElementById('temp_min').value = p.temp_min || '';
   document.getElementById('temp_max').value = p.temp_max || '';
   // Only overwrite these when they were actually recovered for this
-  // profile -- otherwise leave whatever the user already typed (e.g. the
-  // safe placeholder default) alone rather than clobbering it with blank.
+  // profile -- otherwise leave whatever the user already typed alone
+  // rather than clobbering it with blank.
   if (p.filament_id) {{ document.getElementById('filament_id').value = p.filament_id; }}
   if (p.setting_id) {{ document.getElementById('setting_id').value = p.setting_id; }}
 }}
@@ -747,6 +727,7 @@ function submitForm() {{
     name: document.getElementById('name').value,
     type: document.getElementById('type').value,
     vendor: document.getElementById('vendor').value,
+    nozzle_diameter: document.getElementById('nozzle_diameter').value,
     temp_min: document.getElementById('temp_min').value,
     temp_max: document.getElementById('temp_max').value,
     filament_id: document.getElementById('filament_id').value,
@@ -816,18 +797,24 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
             orca.host.ui.message("Nozzle temps must be numbers", title="X1Plus Filament Push")
             return
 
-        new_entry = {
-            result["name"]: {
-                "type": result["type"],
-                "filament_id": result["filament_id"],
-                "nozzle_temperature": [temp_min, temp_max],
-                "filament_is_support": "0",
-                "required_nozzle_HRC": 3,
-                "filament_vendor": result["vendor"],
-                "setting_id": result["setting_id"],
-                "chamber_temperatures": "0",
-                "temperature_vitrification": "45",
-            }
+        short_name = result["name"]
+        nozzle_diameter = result.get("nozzle_diameter") or "0.4"
+        filament_id = result.get("filament_id") or _generate_filament_id()
+        setting_id = result.get("setting_id") or filament_id
+        entry = {
+            "base_id": None,
+            "filament_id": filament_id,
+            "filament_is_support": False,
+            "filament_type": result["type"],
+            "filament_vendor": result["vendor"],
+            "inherits": None,
+            "name": f"{short_name} @Bambu Lab X1 Carbon {nozzle_diameter} nozzle",
+            "nickname": None,
+            "nozzle_hrc": 3,
+            "nozzle_temperature": [temp_min, temp_max],
+            "setting_id": setting_id,
+            "update_time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "version": "1.0.0.0",
         }
 
         deployer = X1PlusDeployer(result["host"])
@@ -838,10 +825,10 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
             # call here, that would deadlock (see _run_with_progress).
             if result.get("password"):
                 deployer.bootstrap(result["password"], progress=progress_cb)
-                deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
+                deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb, confirm_overwrite=confirm_cb)
                 return
             try:
-                deployer.push(new_entry, progress=progress_cb, confirm_overwrite=confirm_cb)
+                deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb, confirm_overwrite=confirm_cb)
             except paramiko.AuthenticationException:
                 # One connection attempt, not a pre-flight key_login_works()
                 # check plus a second real connect inside push() -- that
@@ -858,7 +845,9 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
             orca.host.ui.message(error, title="X1Plus Filament Push failed")
         else:
             _save_last_host(result["host"])
-            orca.host.ui.message(f"Pushed {result['name']!r} to the AMS catalog", title="X1Plus Filament Push")
+            orca.host.ui.message(
+                f"Pushed {short_name!r} to the AMS picker ({nozzle_diameter} mm)", title="X1Plus Filament Push"
+            )
 
 
 class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
