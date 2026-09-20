@@ -39,7 +39,13 @@ jobs:
           changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
           metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog" \
             '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
-          args=(-F "metadata=$metadata")
+          # --form-string, not -F: curl's -F splits its value on ";" to look
+          # for type=/filename= modifiers, so a changelog containing a
+          # literal semicolon corrupts the JSON (confirmed live: a release
+          # description with one ';' in it produced a "must be valid JSON"
+          # 400 from the API). --form-string sends the value with no such
+          # parsing.
+          args=(--form-string "metadata=$metadata")
           shopt -s nullglob
           for file in $PLUGIN_FILES; do
             args+=(-F "files=@$file")
