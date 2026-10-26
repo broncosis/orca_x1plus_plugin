@@ -9,17 +9,21 @@
 # WHAT THIS PLUGIN ACCESSES (security summary -- see README "Security and
 # risks" for the user-facing version):
 #   - Your computer: ONE folder, ~/.x1plus_orca_plugin/, which holds
-#     id_rsa (an SSH private key this plugin generates for itself) and
-#     last_host.txt (the last printer address you used). Nothing else on
-#     your computer is read or written. Your own ~/.ssh/ is never touched.
+#     last_host.txt (the last printer address you used) and, ONLY if you
+#     choose "Remember this printer", id_rsa (an SSH private key this plugin
+#     generates for itself). Nothing else on your computer is read or
+#     written. Your own ~/.ssh/ is never touched.
+#   - Root password: used for one connection, held in memory only, never
+#     saved. Without "Remember", you type it on every push and the plugin
+#     keeps no login to the printer at all.
 #   - Orca: reads filament presets through Orca's read-only preset API, to
 #     pre-fill the form. Nothing is written back to Orca.
 #   - Network: SSH (port 22) to the printer address YOU type into the form,
 #     and nowhere else. No internet access, no telemetry.
-#   - The printer: as root over SSH. The one-time "Set up SSH key" step
-#     uses the root password you type (held in memory for that one
-#     connection, never saved) to append this plugin's PUBLIC key to the
-#     PRINTER's /root/.ssh/authorized_keys. Pushing a filament edits
+#   - The printer: as root over SSH. Only when you choose to remember the
+#     printer (the "Remember this printer" box, or the "Set up SSH key"
+#     capability), the plugin appends its PUBLIC key to the PRINTER's
+#     /root/.ssh/authorized_keys. Pushing a filament edits
 #     /config/screen/userFilaments/<nozzle>.json on the printer (a backup
 #     copy is made the first time) and restarts the printer's screen service.
 #   - Runs no local commands (no subprocess). The shell commands in this
@@ -96,6 +100,17 @@ def _ensure_key_dir():
         os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
 
 
+class NoSavedKeyError(RuntimeError):
+    """No usable saved key for this printer, and no password was given."""
+
+    def __init__(self):
+        super().__init__(
+            "This printer isn't remembered on this computer. Enter the root "
+            "password (tick \"Remember this printer\" if you don't want to "
+            "type it next time)."
+        )
+
+
 class X1PlusDeployer:
     """Same logic as x1plus_deploy.py, inlined so this stays a single-file
     plugin. Keep the two in sync if you change one."""
@@ -121,7 +136,11 @@ class X1PlusDeployer:
         return key, f"{key.get_name()} {key.get_base64()} {PUBLIC_KEY_COMMENT}"
 
     def _connect_key(self):
-        key, _ = self._ensure_keypair()
+        # Never creates a key: a key only exists if the user chose
+        # "Remember this printer" (or ran the set-up capability).
+        if not os.path.exists(PRIVATE_KEY_PATH):
+            raise NoSavedKeyError()
+        key = paramiko.RSAKey.from_private_key_file(PRIVATE_KEY_PATH)
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(self.host, username=self.username, pkey=key, timeout=15,
@@ -204,7 +223,7 @@ class X1PlusDeployer:
         except json.JSONDecodeError:
             return {}
 
-    def push(self, short_name, entry, nozzle_diameter, progress=None, confirm_overwrite=None):
+    def push(self, short_name, entry, nozzle_diameter, progress=None, confirm_overwrite=None, password=None):
         """Add or update one entry in userFilaments/<nozzle_diameter>.json,
         keyed by short_name -- exactly the string shown in the AMS picker's
         material list. Confirmed live against a real printer: this file is
@@ -227,10 +246,13 @@ class X1PlusDeployer:
 
         confirm_overwrite must not touch UI objects directly if this runs
         on a background thread -- see _run_with_progress's confirm_cb,
-        which this is designed to receive."""
+        which this is designed to receive.
+
+        password: if given, log in with it for this push only (nothing
+        saved anywhere); otherwise use the saved key."""
         if progress:
             progress(f"Connecting to {self.host}...")
-        client = self._connect_key()
+        client = self._connect_password(password) if password else self._connect_key()
         try:
             remote_path = f"{USER_FILAMENTS_DIR}/{nozzle_diameter}.json"
             if progress:
@@ -648,8 +670,14 @@ def _build_push_dialog_html(profiles, default_name, default_host=""):
   small {{ display: block; margin-top: 2px; font-size: 11px; color: var(--orca-muted); }}
 </style>
 <label>Printer IP / hostname<input id="host" value="{host_attr}"></label>
-<label>Root password (leave blank if you've already bootstrapped this printer)
+<label>Root password (leave blank if this printer is remembered)
   <input id="password" type="password"></label>
+<label style="display:flex; gap:6px; align-items:flex-start;">
+  <input id="remember" type="checkbox" style="width:auto; margin-top:2px;">
+  <span>Remember this printer. Installs an SSH key so you won't need the
+  password next time. The key is a root login to the printer, saved in
+  ~/.x1plus_orca_plugin/. Leave unticked to use the password for this push
+  only and save nothing.</span></label>
 <hr>
 <label>Filament profile (from Orca)
   <select id="profile" onchange="applyProfile()">
@@ -704,6 +732,7 @@ function submitForm() {{
   orca.submit({{
     host: document.getElementById('host').value,
     password: document.getElementById('password').value,
+    remember: document.getElementById('remember').checked,
     name: document.getElementById('name').value,
     type: document.getElementById('type').value,
     vendor: document.getElementById('vendor').value,
@@ -802,26 +831,29 @@ class PushFilamentToX1Plus(orca.script.ScriptPluginCapabilityBase):
 
         deployer = X1PlusDeployer(result["host"])
 
+        password = result.get("password") or ""
+        remember = bool(result.get("remember"))
+
         def work(progress_cb, confirm_cb):
             # confirm_cb is _run_with_progress's thread-safe handoff -- it
             # must NOT be replaced with a direct orca.host.ui.message()
             # call here, that would deadlock (see _run_with_progress).
-            if result.get("password"):
-                deployer.bootstrap(result["password"], progress=progress_cb)
+            if password and remember:
+                # Install the key first, then push with it.
+                deployer.bootstrap(password, progress=progress_cb)
                 deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb, confirm_overwrite=confirm_cb)
-                return
-            try:
-                deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb, confirm_overwrite=confirm_cb)
-            except paramiko.AuthenticationException:
-                # One connection attempt, not a pre-flight key_login_works()
-                # check plus a second real connect inside push() -- that
-                # used to double the SSH handshake latency (each one easily
-                # 1-3s) before any real work, or the collision prompt,
-                # could even start.
-                raise RuntimeError(
-                    "No stored key works yet for this printer, and no password "
-                    "was given. Enter the root password once to bootstrap."
-                )
+            elif password:
+                # Password for this push only: no key created, nothing
+                # added to the printer's authorized_keys, nothing saved.
+                deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb,
+                              confirm_overwrite=confirm_cb, password=password)
+            else:
+                try:
+                    deployer.push(short_name, entry, nozzle_diameter, progress=progress_cb, confirm_overwrite=confirm_cb)
+                except paramiko.AuthenticationException:
+                    # The saved key exists but this printer doesn't accept it
+                    # (never remembered here, or access was revoked).
+                    raise NoSavedKeyError()
 
         error = _run_with_progress("X1Plus Filament Push", work)
         if error:

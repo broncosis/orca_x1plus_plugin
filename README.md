@@ -21,19 +21,30 @@ material list — so that's not what this project does anymore.
 
 ## Security and risks
 
-OrcaCloud rates this plugin **high risk**. That rating is accurate in one
-specific sense: to edit the printer's filament list, the plugin needs
-**root access to your printer**, and it keeps an SSH key that gives it that
-access. Read this before installing.
+OrcaCloud rates this plugin **high risk**. That's fair: to edit the
+printer's filament list, the plugin needs **root access to your printer**,
+and if you choose to, it keeps an SSH key that gives it that access. Read
+this before installing.
+
+**You choose how much it keeps.** On each push you either:
+
+- **Type the root password and leave "Remember this printer" unticked.**
+  The password is used for that one push and then forgotten. No key is
+  created, nothing is added to the printer, and the plugin holds no way
+  back into your printer afterwards. You type the password every time.
+- **Tick "Remember this printer"** (once). The plugin installs an SSH key
+  so later pushes need no password. More convenient, but that key is a
+  standing root login to the printer (see the risks below).
 
 **What it touches**
 
 | Where | What | Why |
 |---|---|---|
-| Your computer | `~/.x1plus_orca_plugin/id_rsa` (SSH private key the plugin generates) and `last_host.txt` (last printer address) | Logging in to the printer without asking for the password every time |
+| Your computer | `~/.x1plus_orca_plugin/last_host.txt` (last printer address) | Pre-filling the printer address |
+| Your computer | `~/.x1plus_orca_plugin/id_rsa` (SSH private key the plugin generates), **only if you remember a printer** | Logging in without the password |
 | Your computer | Orca's filament presets, read-only, through Orca's plugin API | Pre-filling the form |
 | Network | SSH (port 22) to the printer address you type in | Nothing else: no internet, no telemetry |
-| Printer | Appends the plugin's **public** key to `/root/.ssh/authorized_keys` (one-time setup) | Key-based login |
+| Printer | Appends the plugin's **public** key to `/root/.ssh/authorized_keys`, **only if you remember the printer** | Key-based login |
 | Printer | Edits `/config/screen/userFilaments/<nozzle>.json` (backed up the first time), restarts the screen service | Adding your filament to the AMS picker |
 
 It does **not** read or change your own `~/.ssh/` folder, run programs on
@@ -41,19 +52,19 @@ your computer, or send anything anywhere except the printer.
 
 **Risks you're accepting**
 
-- **The key file is a root login to your printer.** `id_rsa` is stored
+- **If you remember a printer, the key file is a root login to it.** `id_rsa` is stored
   unencrypted, protected only by file permissions (owner read/write only).
   Anyone or anything that can read it can log in to your printer as root
   from your network. The key isn't restricted to specific commands; it
   allows a full root shell.
-- **Your root password is typed into an Orca window** during the
-  one-time setup. It's used for that single connection and never saved,
+- **Your root password is typed into an Orca window.** It's held in
+  memory for one connection and never saved,
   but Orca's plugin system is a permission boundary, not a sandbox: other
   installed plugins run in the same Python process.
 - **The printer's identity isn't verified.** The plugin accepts whatever
   SSH host key the printer presents. Someone on your local network who
   could impersonate the printer's address could capture the root password
-  during setup. Run setup on a network you trust.
+  when you type it. Only use this on a network you trust.
 - **It restarts the printer's touchscreen** (about 10–15 seconds) after
   each push. This hasn't been tested mid-print, so don't push while
   printing.
@@ -65,7 +76,7 @@ let it read/write the two files above and start a background thread. The
 first time it connects to a given printer address, Orca asks once more
 for that network connection. Approve them if you're OK with the above.
 
-**Revoking access**
+**Revoking access** (only needed if you ever remembered a printer)
 
 1. On the printer (over SSH as root):
    `sed -i '/ orca-x1plus-plugin$/d' /root/.ssh/authorized_keys`
@@ -121,26 +132,27 @@ In the Plugins dialog, click the **▶** arrow next to "X1Plus Filament Push"
 to expand it and reveal its two capabilities, each with its own **Run**
 button:
 
-- **X1Plus: Set up SSH key (run once per printer)**
-- **X1Plus: Push filament to AMS**
+- **X1Plus: Push filament to AMS**: what you'll normally use.
+- **X1Plus: Set up SSH key (run once per printer)**: optional. Remembers
+  a printer without pushing anything. The push form's "Remember this
+  printer" box does the same thing.
 
 Alternative: hover the 3D build-plate viewport and press **Space** to open
 Orca's Speed Dial quick-launcher, which lists both by name.
 
-## 3. One-time setup: install your SSH key
+## 3. Decide whether to remember the printer
 
-Run **"X1Plus: Set up SSH key"**. A small form appears asking for the
-printer's IP/hostname and its root password. Fill both in and click
-**Bootstrap**.
+Nothing to set up if you're happy typing the root password on each push.
 
-This connects once with the password (typed directly into Orca — it's never
-seen by anything else, never written to disk), generates a dedicated
-RSA-4096 keypair in `~/.x1plus_orca_plugin/` on your desktop (only if one
-doesn't already exist), appends the public key to the printer's
-`/root/.ssh/authorized_keys`, and verifies key-based login works. After this
-succeeds, you won't need the password again for this printer.
+To skip the password in future, either tick **Remember this printer** the
+next time you push with the password, or run **"X1Plus: Set up SSH key"**
+(printer address + root password, then **Bootstrap**). Either way the
+plugin connects once with the password, generates a dedicated RSA-4096
+keypair in `~/.x1plus_orca_plugin/` (only if one doesn't already exist),
+appends the public key to the printer's `/root/.ssh/authorized_keys`, and
+checks that key login works.
 
-Orca asks once to allow the network connection to this printer address
+Orca asks once to allow the network connection to each printer address
 the first time. See [Security and risks](#security-and-risks) for every
 prompt the plugin triggers and why.
 
@@ -148,8 +160,9 @@ prompt the plugin triggers and why.
 
 Run **"X1Plus: Push filament to AMS"**. In the form:
 
-1. Enter the printer's IP/hostname (leave the password field blank — you
-   already bootstrapped the key in step 3).
+1. Enter the printer's IP/hostname. Then either type the root password
+   (tick **Remember this printer** if you want to skip it next time), or
+   leave the password blank if this printer is already remembered.
 2. Pick an existing profile from the **Filament profile** dropdown (your own
    custom profiles are listed separately from Orca's system profiles). This
    auto-fills display name, type, vendor, nozzle temperature range, and
