@@ -6,6 +6,26 @@
 # description = "Push a custom filament profile into an X1Plus-modified printer's AMS catalog over SSH"
 # ///
 #
+# WHAT THIS PLUGIN ACCESSES (security summary -- see README "Security and
+# risks" for the user-facing version):
+#   - Your computer: ONE folder, ~/.x1plus_orca_plugin/, which holds
+#     id_rsa (an SSH private key this plugin generates for itself) and
+#     last_host.txt (the last printer address you used). Nothing else on
+#     your computer is read or written. Your own ~/.ssh/ is never touched.
+#   - Orca: reads filament presets through Orca's read-only preset API, to
+#     pre-fill the form. Nothing is written back to Orca.
+#   - Network: SSH (port 22) to the printer address YOU type into the form,
+#     and nowhere else. No internet access, no telemetry.
+#   - The printer: as root over SSH. The one-time "Set up SSH key" step
+#     uses the root password you type (held in memory for that one
+#     connection, never saved) to append this plugin's PUBLIC key to the
+#     PRINTER's /root/.ssh/authorized_keys. Pushing a filament edits
+#     /config/screen/userFilaments/<nozzle>.json on the printer (a backup
+#     copy is made the first time) and restarts the printer's screen service.
+#   - Runs no local commands (no subprocess). The shell commands in this
+#     file (mkdir, chmod, grep, touch, echo, test, cp, and the screen-service
+#     restart) all run ON THE PRINTER over SSH.
+#
 # Verified against the real OrcaSlicer plugin-host source (not just docs):
 #   - `dependencies` must live in the PEP 723 root section, not nested inside
 #     [tool.orcaslicer.plugin] -- Orca's TOML parser only reads it there.
@@ -46,6 +66,10 @@ except ImportError:
     paramiko = None
 
 
+# This plugin's own folder. It is the only place on your computer the
+# plugin reads or writes. id_rsa is a key the plugin generates for itself
+# (see X1PlusDeployer._ensure_keypair); it is NOT your ~/.ssh key and is
+# never sent anywhere -- only its public half is installed on the printer.
 KEY_DIR = os.path.expanduser("~/.x1plus_orca_plugin")
 PRIVATE_KEY_PATH = os.path.join(KEY_DIR, "id_rsa")
 LAST_HOST_PATH = os.path.join(KEY_DIR, "last_host.txt")
@@ -63,6 +87,15 @@ USER_FILAMENTS_DIR = "/config/screen/userFilaments"
 NOZZLE_DIAMETERS = ["0.2", "0.4", "0.6", "0.8"]
 
 
+def _ensure_key_dir():
+    """Create KEY_DIR only if it's missing. os.makedirs(exist_ok=True) still
+    raises Orca's folder-create permission check when the folder already
+    exists, and Orca has no way to pre-grant folder creation, so calling it
+    unconditionally would prompt on every run."""
+    if not os.path.isdir(KEY_DIR):
+        os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+
+
 class X1PlusDeployer:
     """Same logic as x1plus_deploy.py, inlined so this stays a single-file
     plugin. Keep the two in sync if you change one."""
@@ -72,12 +105,18 @@ class X1PlusDeployer:
         self.username = username
 
     def _ensure_keypair(self):
-        os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+        _ensure_key_dir()
         if os.path.exists(PRIVATE_KEY_PATH):
             key = paramiko.RSAKey.from_private_key_file(PRIVATE_KEY_PATH)
         else:
             key = paramiko.RSAKey.generate(4096)
-            key.write_private_key_file(PRIVATE_KEY_PATH)
+            # Not key.write_private_key_file(): that writes through
+            # os.fdopen(fd), which Orca audits as an "open" with no path,
+            # so the fs_readwrite grant declared in register_capabilities
+            # can't cover it. open() by path (created 0600 via the opener)
+            # is covered.
+            with open(PRIVATE_KEY_PATH, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+                key.write_private_key(f)
             os.chmod(PRIVATE_KEY_PATH, 0o600)
         return key, f"{key.get_name()} {key.get_base64()} {PUBLIC_KEY_COMMENT}"
 
@@ -112,6 +151,10 @@ class X1PlusDeployer:
             progress(f"Connecting to {self.host}...")
         client = self._connect_password(password)
         try:
+            # Everything below runs ON THE PRINTER over SSH (self._run is
+            # exec_command on the remote side), not on your computer. It
+            # adds this plugin's PUBLIC key to the printer's root
+            # authorized_keys, once (grep checks it isn't already there).
             self._run(client, "mkdir -p /root/.ssh && chmod 700 /root/.ssh")
             check_cmd = f"grep -qxF '{pubkey_line}' /root/.ssh/authorized_keys 2>/dev/null"
             exit_status, _, _ = self._run(client, check_cmd, check=False)
@@ -255,7 +298,7 @@ def _save_last_host(host):
     if not host:
         return
     try:
-        os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+        _ensure_key_dir()
         with open(LAST_HOST_PATH, "w", encoding="utf-8") as f:
             f.write(host)
     except OSError:
@@ -847,19 +890,23 @@ class BootstrapX1Plus(orca.script.ScriptPluginCapabilityBase):
 @orca.plugin
 class X1PlusPlugin(orca.base):
     def register_capabilities(self):
-        # orca.request_permissions() is only callable here, during plugin
-        # discovery -- confirmed against source (PythonPluginBridge.cpp):
-        # calling it later (e.g. from inside a running capability) raises.
-        # It batches every listed path into ONE upfront Yes/No prompt,
-        # persisted into .install_state.json, rather than a separate prompt
-        # per file per run. Matching is by exact string, so these must be
-        # the literal paths later passed to open() -- which they are, since
-        # both are the same module-level constants used everywhere else.
-        # This does NOT cover the doomed preset-JSON reads discussed above
-        # (those are blocked by a different, unconditional check that
-        # doesn't consult this permission list at all).
+        # Declares everything this plugin does on your computer, so Orca
+        # shows it in ONE prompt at load time (saved in .install_state.json)
+        # instead of failing or prompting mid-run. Only callable here, during
+        # plugin discovery (PythonPluginBridge.cpp raises otherwise).
+        #   fs_read / fs_readwrite: the two files in KEY_DIR, by exact path
+        #     (read the key + last host; write them the first time).
+        #   threading: the background thread that does the SSH work so
+        #     Orca's UI doesn't freeze.
+        # Not declarable here: the SSH connection, because its target is the
+        # printer address typed into the form. Orca asks about that once
+        # per printer address on first connect.
         try:
-            orca.request_permissions(fs_read=[PRIVATE_KEY_PATH, LAST_HOST_PATH])
+            orca.request_permissions(
+                fs_read=[PRIVATE_KEY_PATH, LAST_HOST_PATH],
+                fs_readwrite=[PRIVATE_KEY_PATH, LAST_HOST_PATH],
+                threading=True,
+            )
         except Exception:
             pass  # older Orca build without this API -- reads just fall back to per-event prompts
         orca.register_capability(BootstrapX1Plus)

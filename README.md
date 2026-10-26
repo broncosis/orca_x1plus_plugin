@@ -19,6 +19,64 @@ adding an entry to `userFilaments` did, immediately. Whatever the
 official-catalog override actually governs, it isn't the manual picker's
 material list — so that's not what this project does anymore.
 
+## Security and risks
+
+OrcaCloud rates this plugin **high risk**. That rating is accurate in one
+specific sense: to edit the printer's filament list, the plugin needs
+**root access to your printer**, and it keeps an SSH key that gives it that
+access. Read this before installing.
+
+**What it touches**
+
+| Where | What | Why |
+|---|---|---|
+| Your computer | `~/.x1plus_orca_plugin/id_rsa` (SSH private key the plugin generates) and `last_host.txt` (last printer address) | Logging in to the printer without asking for the password every time |
+| Your computer | Orca's filament presets, read-only, through Orca's plugin API | Pre-filling the form |
+| Network | SSH (port 22) to the printer address you type in | Nothing else: no internet, no telemetry |
+| Printer | Appends the plugin's **public** key to `/root/.ssh/authorized_keys` (one-time setup) | Key-based login |
+| Printer | Edits `/config/screen/userFilaments/<nozzle>.json` (backed up the first time), restarts the screen service | Adding your filament to the AMS picker |
+
+It does **not** read or change your own `~/.ssh/` folder, run programs on
+your computer, or send anything anywhere except the printer.
+
+**Risks you're accepting**
+
+- **The key file is a root login to your printer.** `id_rsa` is stored
+  unencrypted, protected only by file permissions (owner read/write only).
+  Anyone or anything that can read it can log in to your printer as root
+  from your network. The key isn't restricted to specific commands; it
+  allows a full root shell.
+- **Your root password is typed into an Orca window** during the
+  one-time setup. It's used for that single connection and never saved,
+  but Orca's plugin system is a permission boundary, not a sandbox: other
+  installed plugins run in the same Python process.
+- **The printer's identity isn't verified.** The plugin accepts whatever
+  SSH host key the printer presents. Someone on your local network who
+  could impersonate the printer's address could capture the root password
+  during setup. Run setup on a network you trust.
+- **It restarts the printer's touchscreen** (about 10–15 seconds) after
+  each push. This hasn't been tested mid-print, so don't push while
+  printing.
+- **It installs [paramiko](https://www.paramiko.org/)** (the SSH library)
+  from PyPI into Orca's Python environment on first load.
+
+**Orca's permission prompts.** When the plugin loads, Orca asks once to
+let it read/write the two files above and start a background thread. The
+first time it connects to a given printer address, Orca asks once more
+for that network connection. Approve them if you're OK with the above.
+
+**Revoking access**
+
+1. On the printer (over SSH as root):
+   `sed -i '/ orca-x1plus-plugin$/d' /root/.ssh/authorized_keys`
+2. On your computer: delete `~/.x1plus_orca_plugin/`.
+3. Uninstall the plugin from Orca's Plugins dialog.
+
+Prefer not to type the root password into Orca? The standalone
+`x1plus_deploy.py` CLI (see below) does the same setup from a terminal. It
+uses the same key in `~/.x1plus_orca_plugin/`, so the key risks above
+still apply.
+
 ## Requirements
 
 - A Bambu X1/X1C running **X1Plus** custom firmware (root SSH access).
@@ -82,15 +140,9 @@ doesn't already exist), appends the public key to the printer's
 `/root/.ssh/authorized_keys`, and verifies key-based login works. After this
 succeeds, you won't need the password again for this printer.
 
-You'll see a couple of one-time permission prompts from Orca's plugin
-sandbox the first time the plugin opens a network socket, and the first
-time it reads one of your own filament profiles to look up its id (a
-"process" permission request — this plugin reads certain files by spawning
-`cat` rather than calling Python's `open()` directly, since Orca's sandbox
-otherwise unconditionally blocks reading anything under its own config
-directory; see the code comments in `orca_plugin_x1plus.py` for the full
-explanation). Approve both — each is a one-time approval per Orca launch,
-not per file or per push.
+Orca asks once to allow the network connection to this printer address
+the first time. See [Security and risks](#security-and-risks) for every
+prompt the plugin triggers and why.
 
 ## 4. Push a filament
 
@@ -100,8 +152,8 @@ Run **"X1Plus: Push filament to AMS"**. In the form:
    already bootstrapped the key in step 3).
 2. Pick an existing profile from the **Filament profile** dropdown (your own
    custom profiles are listed separately from Orca's system profiles). This
-   auto-fills display name, type, vendor, nozzle temperature range, and —
-   when it can actually be recovered for that profile — `filament_id`.
+   auto-fills display name, type, vendor, nozzle temperature range, and
+   `filament_id` (computed the same way Orca computes it).
    Alternatively, ignore the dropdown and fill the fields in by hand.
 3. Pick the **nozzle diameter** you're targeting (0.2/0.4/0.6/0.8mm). The
    picker's custom-filament list is per nozzle size on the printer.
@@ -151,10 +203,9 @@ any GUI. See the top of that file for `bootstrap` / `push` / `remove` usage.
   reasonably complete per-filament record (type, vendor, temps, ids), but
   still not a full slicer print profile. The rest of what Orca knows about
   a filament stays in Orca.
-- `setting_id` genuinely doesn't exist for a from-scratch custom filament
-  with no official Bambu catalog lineage — Orca itself never assigns one.
-  When it can't be found, this plugin reuses `filament_id` as a stand-in,
-  since nothing here validates its format or uniqueness.
+- `setting_id` defaults to the same value as `filament_id`. Orca's plugin
+  API doesn't expose a preset's real `setting_id`, and the AMS only matches
+  on `filament_id`. You can type a different one in the form.
 - No rename: pushing under a new display name for what you consider "the
   same" filament creates a second, separate entry rather than renaming the
   old one. Remove the old one explicitly via the CLI if you want it gone.
