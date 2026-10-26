@@ -12,12 +12,15 @@
 #   - There is no synchronous `orca.host.ui.show_dialog()`. The real API is
 #     `orca.host.ui.create_window(html, title, width, height, on_submit,
 #     on_close, style)`, which is asynchronous: it returns immediately and
-#     delivers the submitted form data via the on_submit callback. execute()
-#     must not block waiting for it (it runs on the main/UI thread; blocking
-#     here would stop the window's own JS bridge callback from ever being
-#     dispatched). So execute() opens the window and returns; the actual
-#     deploy work happens inside the on_submit callback, in a background
-#     thread, same as before.
+#     delivers the submitted form data via the on_submit callback. So
+#     execute() opens the window and returns; the actual deploy work happens
+#     inside the on_submit callback (UI thread), in a background thread.
+#   - As of Orca's Oct 2026 nightlies, execute() itself runs on a worker
+#     thread, not the UI thread. Off the UI thread, any file/process/network
+#     access the plugin hasn't been granted yet is denied AND queues a
+#     permission popup for later. execute() must therefore stick to the
+#     preset bindings and paths declared in orca.request_permissions() --
+#     anything else floods Orca with popups (this crashed Orca once).
 #   - `orca.ExecutionResult.failure()` requires a leading `orca.PluginResult`
 #     status enum argument, not just a message string.
 #
@@ -32,7 +35,6 @@ import html
 import json
 import os
 import re
-import subprocess
 import threading
 import uuid
 
@@ -260,169 +262,6 @@ def _save_last_host(host):
         pass  # not fatal -- just means we'll ask again next time
 
 
-def _read_file_via_subprocess(path):
-    """Read a file's raw bytes, bypassing Orca's plugin audit sandbox.
-
-    filament_id/setting_id (Bambu's GFxxx cloud catalog IDs) are not
-    reachable through the Python preset bindings at all (config_value()
-    only reaches DynamicPrintConfig options; these two are separate string
-    members directly on the C++ Preset object, never merged into that
-    config) -- so reading them means reading Orca's own preset JSON files
-    directly. Doing that via Python's open() is unconditionally blocked on
-    Linux: confirmed via PluginAuditManager::is_denied_path_keyword(),
-    which denies any path containing "conf" as a substring in ANY path
-    component -- checked before permissions or allowed-roots, with no
-    override -- and every path under Orca's data directory hits this,
-    since "~/.config" contains "conf". That block only applies to
-    filesystem-category audit events though (confirmed via
-    is_fs_category(): open/os.mkdir/etc, not process creation), so it
-    never fires for a subprocess call at all.
-
-    Spawning `cat` still needs one user approval (a "process" permission
-    prompt) the first time -- but Orca's "approved ancestor" cascade
-    (designed so e.g. approving urllib.request also covers the
-    socket.connect calls it makes internally, confirmed via
-    has_approved_ancestor()/call_site_identities() walking the CPython call
-    stack up to but not including the plugin's own frame) then silently
-    allows every subsequent subprocess call through the same stdlib call
-    path for the rest of the Orca session, regardless of which file it
-    reads. So this is one approval per Orca launch, not one per file --
-    approve it when it appears.
-
-    Linux/macOS only (shells out to the `cat` binary, no shell involved --
-    argv is a list, not a string, so no injection risk); no Windows
-    fallback yet. Returns None on any failure (missing file, non-zero
-    exit, timeout) rather than raising, since every caller treats a miss
-    here as just "leave the field for manual entry"."""
-    try:
-        result = subprocess.run(["cat", path], capture_output=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
-
-
-def _list_dir_via_subprocess(path, cache):
-    """List a directory's entries via `ls -1`, same audit-bypass rationale
-    as _read_file_via_subprocess. `cache` is a plain dict the caller keeps
-    across a whole _list_filament_profiles() run, keyed by directory path
-    -- listing a directory once and matching candidate filenames against
-    it in Python is far cheaper than spawning `cat` once per CANDIDATE
-    file (most of which don't exist) for every preset. With ~6-8 X1/X1C
-    nozzle-diameter candidates tried per preset and potentially hundreds
-    of presets across all loaded vendors, that was hundreds to low
-    thousands of subprocess spawns per dialog open -- each one still going
-    through the full audit_hook dispatch even after the one-time approval
-    -- which is the real cost, not the approval dialog itself. Listing
-    each unique directory once (most presets sharing the same one)
-    collapses that to a handful of `ls` calls plus only the reads that are
-    actually going to succeed."""
-    if path not in cache:
-        try:
-            result = subprocess.run(["ls", "-1", path], capture_output=True, timeout=5)
-            cache[path] = set(result.stdout.decode("utf-8", errors="replace").splitlines()) if result.returncode == 0 else set()
-        except (OSError, subprocess.SubprocessError):
-            cache[path] = set()
-    return cache[path]
-
-
-def _read_ids_from_base_cache(preset_file_path, preset_name, x1_printer_names, dir_cache):
-    """Orca caches a fully-resolved (inheritance-flattened) snapshot of a
-    user preset per printer/nozzle combination it's actually been used
-    with, in a "base" subdirectory next to the preset's own delta file,
-    named "<preset name> @<printer preset name>.json" -- confirmed by
-    inspecting real cached files on disk. Unlike the preset's own delta
-    file (which stores only overrides relative to its parent), these
-    snapshots have every field already merged in, including filament_id
-    (as one of Orca's own synthetic ids, e.g. "P6f52551", not a Bambu
-    GFxxx-style id -- confirmed against real cached files -- but that's
-    fine here, it only needs to not collide with an existing catalog
-    entry).
-
-    dir_cache is passed through to _list_dir_via_subprocess so the same
-    "base" directory (shared by every preset in one user profile) is only
-    listed once per _list_filament_profiles() run, not once per preset.
-
-    Only checks combinations against X1/X1C printer names, since that's
-    what we're pushing to. Orca builds these caches lazily, only for
-    printer/nozzle combos actually used in the app -- a preset that's
-    never been selected while an X1 was the active printer simply won't
-    have one yet, so a miss here is expected, not a bug; callers should
-    fall back to the direct inherits-chain walk."""
-    base_dir = os.path.join(os.path.dirname(preset_file_path), "base")
-    entries = _list_dir_via_subprocess(base_dir, dir_cache)
-    for printer_name in x1_printer_names:
-        candidate_name = f"{preset_name} @{printer_name}.json"
-        if candidate_name not in entries:
-            continue
-        raw = _read_file_via_subprocess(os.path.join(base_dir, candidate_name))
-        if raw is None:
-            continue
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            continue
-        filament_id = data.get("filament_id", "") or ""
-        setting_id = data.get("setting_id", "") or ""
-        if filament_id or setting_id:
-            return filament_id, setting_id
-    return "", ""
-
-
-def _read_catalog_ids_from_preset_file(path, collection=None, _depth=0):
-    """Read Bambu's cloud catalog IDs (filament_id/setting_id, e.g. "GFA00")
-    out of a preset's own JSON file on disk, walking its "inherits" chain.
-
-    Walking "inherits" is necessary, not optional: confirmed against real
-    shipped BBL profiles that these two fields routinely live on DIFFERENT
-    files in the same chain. E.g. for "Bambu PLA Basic" on an X1 Carbon,
-    `preset.file` resolves to ".../Bambu PLA Basic @BBL X1C.json", which
-    directly defines "setting_id" but NOT "filament_id" -- that one only
-    exists on its parent, ".../Bambu PLA Basic @base.json" (referenced via
-    that file's own "inherits" key, resolved to a sibling file in the same
-    directory).
-
-    Also tries Orca's own PresetCollection.find_preset() to resolve
-    "inherits" before falling back to the same-directory sibling-file
-    guess, since a CUSTOM preset's "inherits" value is often a canonical
-    name (e.g. "Generic PLA @MyToolChanger") pointing at a file in a
-    completely different directory than the child.
-
-    Returns ("", "") if the file (or any ancestor) is missing, unreadable,
-    not JSON, the reference can't be resolved, or the chain never defines a
-    field -- silently, since this remains best-effort and the fields stay
-    manually editable either way."""
-    if not path or _depth > 8:  # depth guard against an unexpected inherits cycle
-        return "", ""
-    raw = _read_file_via_subprocess(path)
-    if raw is None:
-        return "", ""
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return "", ""
-
-    filament_id = data.get("filament_id", "") or ""
-    setting_id = data.get("setting_id", "") or ""
-    inherits = data.get("inherits", "")
-    if inherits and (not filament_id or not setting_id):
-        parent_path = ""
-        if collection is not None:
-            try:
-                parent_preset = collection.find_preset(inherits)
-                if parent_preset is not None:
-                    parent_path = getattr(parent_preset, "file", "") or ""
-            except Exception:
-                parent_path = ""
-        if not parent_path:
-            parent_path = os.path.join(os.path.dirname(path), f"{inherits}.json")
-        parent_filament_id, parent_setting_id = _read_catalog_ids_from_preset_file(parent_path, collection, _depth + 1)
-        filament_id = filament_id or parent_filament_id
-        setting_id = setting_id or parent_setting_id
-    return filament_id, setting_id
-
-
 # X1Plus firmware targets the X1 / X1 Carbon -- deliberately excludes the
 # enterprise X1E, which isn't what this project jailbreaks. Matched against
 # printer_model (not preset name), since "Bambu Lab X1" is itself a string
@@ -517,9 +356,8 @@ def _material_display_name(preset_name):
 # cached/resolved id off disk turned out to carry a PRE-MIGRATION id:
 # OrcaSlicer's system filament catalog moved to content-addressed "OF..."
 # ids (docs/HLSD/filament_id.md: "No vendor is exempt from the filament_id
-# rule"), but this plugin's disk-cache read (_read_ids_from_base_cache /
-# _read_catalog_ids_from_preset_file, still used below only for setting_id)
-# doesn't get invalidated when Orca's own catalog re-mints -- confirmed live
+# rule"), but the plugin's old disk-cache read (since removed -- see
+# _list_filament_profiles) didn't get invalidated when Orca's own catalog re-mints -- confirmed live
 # against a real printer: every filament already pushed there carried the
 # OLD "P" + md5(name)[:7] scheme, which no longer matches any currently
 # loaded system preset, so Orca's own AMS panel silently falls back to
@@ -587,8 +425,8 @@ def _list_filament_profiles():
 
     Returns (profiles, default_name) where profiles maps
     name -> {"material_name", "type", "vendor", "temp_min", "temp_max",
-    "filament_id", "setting_id", "is_user"} (the last two are often "" --
-    see _read_catalog_ids_from_preset_file), and default_name is the
+    "filament_id", "setting_id", "is_user"} (filament_id is "" when the
+    preset has no vendor/type to mint from), and default_name is the
     currently-selected preset's name (or "" if that can't be determined, or
     if it got filtered out -- not fatal, the dropdown just opens
     unselected)."""
@@ -598,14 +436,12 @@ def _list_filament_profiles():
         bundle = orca.host.preset_bundle()
         collection = bundle.filaments
         x1_printer_names = _x1_printer_preset_names(bundle)
-        dir_cache = {}  # shared across every preset below -- see _list_dir_via_subprocess
         for name in collection.preset_names():
             preset = collection.find_preset(name)
             if preset is None:
                 continue
             if x1_printer_names and not _is_x1_compatible(preset, x1_printer_names):
                 continue
-            preset_file = getattr(preset, "file", "")
             is_user = bool(preset.is_user())
             material_name = _material_display_name(name)
             ftype = preset.config_value("filament_type") or ""
@@ -622,24 +458,17 @@ def _list_filament_profiles():
             else:
                 filament_id = ""  # missing vendor/type -- can't mint; leave blank
 
-            # setting_id is Bambu's cloud-settings-database id, per-preset
-            # (not per-product like filament_id) and orthogonal to the AMS
-            # tray-matching bug above (get_filament_by_filament_id only
-            # ever checks filament_id) -- still read from disk, still
-            # best-effort, unchanged from before.
-            _, setting_id = _read_ids_from_base_cache(preset_file, name, x1_printer_names, dir_cache)
-            if not setting_id:
-                _, setting_id = _read_catalog_ids_from_preset_file(preset_file, collection)
-            if not setting_id:
-                # Orca never assigns one to a preset with no official Bambu
-                # catalog lineage (confirmed: present in the resolved
-                # config as a literal null for a from-scratch custom
-                # filament, not merely unfound). Our own collision check
-                # only ever validates filament_id, never setting_id, so
-                # reusing filament_id here is a safe, always-populated
-                # stand-in -- better than the generic GFSL999 placeholder,
-                # which is easy to forget to change across different pushes.
-                setting_id = filament_id
+            # setting_id reuses filament_id. Orca's Python preset bindings
+            # don't expose setting_id, and the old workaround (spawning
+            # `cat`/`ls` on Orca's preset JSON files) crashed Orca once
+            # Orca started running execute() on a worker thread: each
+            # spawn's pipe open() was denied there and queued its own
+            # permission popup -- hundreds per dialog open -- and WebKit
+            # aborted creating this plugin's window underneath that stack
+            # of modals. The AMS tray match only checks filament_id
+            # (get_filament_by_filament_id), and the field stays editable
+            # in the form.
+            setting_id = filament_id
             profiles[name] = {
                 "material_name": material_name,
                 "type": ftype,
